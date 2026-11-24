@@ -1,0 +1,5 @@
+Company Name,Phone number,Type,Website,Email,City,State,Zip Code,Category,Company Source URL,Notes
+Apex Commercial Builders LLC,1-512-555-0142 ext 204,landline,https://www.apexcommercialbuilders.example.com/about,bids@apexcommercialbuilders.example.com,austin,Texas,78701,General Contractor,https://example.com/dir/apex,Test sample 1
+Apex Commercial Builders Inc.,(512) 555-0142,landline,apexcommercialbuilders.example.com,,Austin,TX,78701,Commercial Contractor,https://example.com/permit/102,Duplicate by domain and phone with extra source
+Summit Millwork & Cabinetry Co.,214-555-0199,cell,https://summitmillwork.example.com,estimating@summitmillwork.example.com,dallas,TX,75201,Millwork Contractor,https://example.com/dir/summit,Test sample 2
+,555-0000,,,,Nowhere,ZZ,,Unknown,,Intentional invalid test row for validation check
