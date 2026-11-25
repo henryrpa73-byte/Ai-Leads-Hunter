@@ -4,6 +4,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer as createViteServer } from 'vite';
+import { type CrmPlatform, mapLeadsToCrmRecords } from './src/lib/crmSync.ts';
 import { buildNormalizedLead, inferServiceOpportunity } from './src/lib/leadEngine.ts';
 import type { Lead } from './src/types/lead.ts';
 
@@ -15,12 +16,19 @@ const USER_AGENT = 'ConstructionLeadHunter/1.0 (+public-research)';
 const NAICS_TARGETS: Record<string, string> = {
   '236220': 'Commercial and Institutional Building Construction',
   '236118': 'Residential Remodelers',
+  '236115': 'New Single-Family Housing Builders',
   '238350': 'Finish Carpentry Contractors',
   '337110': 'Wood Kitchen Cabinet and Countertop Manufacturing',
   '541310': 'Architectural Services',
+  '541330': 'Engineering & Structural Design',
+  '541340': 'Drafting & CAD Services',
 };
 
 function isPrivateIp(ip: string): boolean {
+  const low = ip.toLowerCase();
+  if (low.startsWith('::ffff:')) {
+    return isPrivateIp(low.slice(7));
+  }
   if (net.isIPv4(ip)) {
     const parts = ip.split('.').map(Number);
     if (parts[0] === 10 || parts[0] === 127 || parts[0] === 0) return true;
@@ -29,8 +37,7 @@ function isPrivateIp(ip: string): boolean {
     if (parts[0] === 192 && parts[1] === 168) return true;
     return false;
   }
-  const low = ip.toLowerCase();
-  return low === '::1' || low.startsWith('fc') || low.startsWith('fd') || low.startsWith('fe80');
+  return low === '::1' || low === '::' || low.startsWith('fc') || low.startsWith('fd') || low.startsWith('fe80');
 }
 
 async function assertSafePublicUrl(rawUrl: string): Promise<URL> {
@@ -38,8 +45,18 @@ async function assertSafePublicUrl(rawUrl: string): Promise<URL> {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error('Only HTTP/HTTPS URLs are supported.');
   }
-  if (parsed.hostname === 'localhost' || parsed.hostname.endsWith('.local')) {
+  const host = parsed.hostname.toLowerCase();
+  if (
+    host === 'localhost' ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host === 'metadata.google.internal' ||
+    host === 'metadata'
+  ) {
     throw new Error('Localhost and internal hostnames are not allowed.');
+  }
+  if (net.isIP(host) && isPrivateIp(host)) {
+    throw new Error('Private or loopback IP addresses are not allowed.');
   }
   const records = await dns.lookup(parsed.hostname, { all: true });
   for (const rec of records) {
@@ -72,9 +89,9 @@ async function fetchJsonWithTimeout(url: string, init: RequestInit = {}, timeout
   }
 }
 
-async function discoverUsaSpending(stateFilter: string, limitPerNaics: number): Promise<Lead[]> {
+async function discoverUsaSpending(stateFilter: string, limitPerNaics: number, page = 1): Promise<Lead[]> {
   const end = new Date();
-  const start = new Date(end.getTime() - 180 * 24 * 60 * 60 * 1000);
+  const start = new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000);
   const startDate = start.toISOString().slice(0, 10);
   const endDate = end.toISOString().slice(0, 10);
 
@@ -83,244 +100,494 @@ async function discoverUsaSpending(stateFilter: string, limitPerNaics: number): 
     locationFilter.state = stateFilter;
   }
 
-  const leads: Lead[] = [];
+  const perNaics = Math.max(1, Math.min(60, limitPerNaics));
+  const fetchDetails = perNaics <= 5;
   const naicsEntries = Object.entries(NAICS_TARGETS);
 
-  for (const [naics, categoryLabel] of naicsEntries) {
-    const body = {
-      fields: [
-        'Award ID',
-        'Recipient Name',
-        'Award Amount',
-        'Description',
-        'Start Date',
-        'Awarding Agency',
-        'Place of Performance State Code',
-        'Place of Performance Zip5',
-        'generated_internal_id',
-      ],
-      filters: {
-        award_type_codes: ['A', 'B', 'C', 'D'],
-        naics_codes: [naics],
-        place_of_performance_locations: [locationFilter],
-        time_period: [{ start_date: startDate, end_date: endDate }],
-      },
-      limit: Math.max(1, Math.min(10, limitPerNaics)),
-      page: 1,
-      sort: 'Award Amount',
-      order: 'desc',
-    };
+  const naicsResults = await Promise.all(
+    naicsEntries.map(async ([naics, categoryLabel]) => {
+      const body = {
+        fields: [
+          'Award ID',
+          'Recipient Name',
+          'Award Amount',
+          'Description',
+          'Start Date',
+          'End Date',
+          'Awarding Agency',
+          'Place of Performance State Code',
+          'Place of Performance Zip5',
+          'generated_internal_id',
+        ],
+        filters: {
+          award_type_codes: ['A', 'B', 'C', 'D'],
+          naics_codes: [naics],
+          place_of_performance_locations: [locationFilter],
+          time_period: [{ start_date: startDate, end_date: endDate }],
+        },
+        limit: perNaics,
+        page: Math.max(1, page),
+        sort: 'Award Amount',
+        order: 'desc',
+      };
 
-    const data = (await fetchJsonWithTimeout('https://api.usaspending.gov/api/v2/search/spending_by_award/', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })) as { results?: Array<Record<string, unknown>> };
+      try {
+        const data = (await fetchJsonWithTimeout(
+          'https://api.usaspending.gov/api/v2/search/spending_by_award/',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          },
+          10000,
+        )) as { results?: Array<Record<string, unknown>> };
 
-    for (const row of data.results || []) {
-      const genId = String(row['generated_internal_id'] || '');
-      let city = '';
-      let state = String(row['Place of Performance State Code'] || '');
-      let zip = String(row['Place of Performance Zip5'] || '');
-      let recipientName = String(row['Recipient Name'] || '');
-      let categories: string[] = [];
-      let popLocation = state;
-      let contactPerson = '';
-      let jobTitle = '';
-      let liveStatus = String(row['Start Date'] || '') ? 'Awarded' : 'Active';
-
-      if (genId) {
-        try {
-          const detail = (await fetchJsonWithTimeout(
-            `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(genId)}/`,
-            {},
-            8000,
-          )) as {
-            recipient?: {
-              recipient_name?: string;
-              business_categories?: string[];
-              location?: { city_name?: string; state_code?: string; zip5?: string };
-            };
-            executive_details?: {
-              officers?: Array<{ name?: string | null }>;
-            };
-            period_of_performance?: {
-              start_date?: string | null;
-              end_date?: string | null;
-              potential_end_date?: string | null;
-            };
-            place_of_performance?: { city_name?: string; state_code?: string };
-          };
-          const rec = detail.recipient;
-          if (rec?.recipient_name) recipientName = rec.recipient_name;
-          if (rec?.location?.city_name) city = rec.location.city_name;
-          if (rec?.location?.state_code) state = rec.location.state_code;
-          if (rec?.location?.zip5) zip = rec.location.zip5;
-          if (Array.isArray(rec?.business_categories)) categories = rec.business_categories;
-          const popCity = detail.place_of_performance?.city_name || '';
-          const popState = detail.place_of_performance?.state_code || state;
-          popLocation = [popCity, popState].filter(Boolean).join(', ');
-
-          const officerName = (detail.executive_details?.officers || []).find((o) => o?.name)?.name || '';
-          if (officerName) {
-            contactPerson = officerName.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
-            jobTitle = 'Executive Officer';
-          }
-
-          const endDt = String(
-            detail.period_of_performance?.end_date || detail.period_of_performance?.potential_end_date || '',
-          ).slice(0, 10);
+        const naicsLeads: Lead[] = [];
+        for (const row of data.results || []) {
+          const genId = String(row['generated_internal_id'] || '');
+          let city = '';
+          let state = String(row['Place of Performance State Code'] || '');
+          let zip = String(row['Place of Performance Zip5'] || '');
+          let recipientName = String(row['Recipient Name'] || '');
+          let categories: string[] = [];
+          let popLocation = state;
+          let contactPerson = '';
+          let jobTitle = '';
+          const rawEndDt = String(row['End Date'] || '').slice(0, 10);
           const todayIso = new Date().toISOString().slice(0, 10);
-          if (endDt) {
-            liveStatus = endDt >= todayIso ? `Live Won Project (ends ${endDt})` : `Completed Award (ended ${endDt})`;
+          let liveStatus = rawEndDt
+            ? rawEndDt >= todayIso
+              ? `Live Won Project (ends ${rawEndDt})`
+              : `Completed Award (ended ${rawEndDt})`
+            : String(row['Start Date'] || '')
+              ? 'Awarded'
+              : 'Active';
+
+          if (fetchDetails && genId) {
+            try {
+              const detail = (await fetchJsonWithTimeout(
+                `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(genId)}/`,
+                {},
+                7000,
+              )) as {
+                recipient?: {
+                  recipient_name?: string;
+                  business_categories?: string[];
+                  location?: { city_name?: string; state_code?: string; zip5?: string };
+                };
+                executive_details?: {
+                  officers?: Array<{ name?: string | null }>;
+                };
+                period_of_performance?: {
+                  start_date?: string | null;
+                  end_date?: string | null;
+                  potential_end_date?: string | null;
+                };
+                place_of_performance?: { city_name?: string; state_code?: string };
+              };
+              const rec = detail.recipient;
+              if (rec?.recipient_name) recipientName = rec.recipient_name;
+              if (rec?.location?.city_name) city = rec.location.city_name;
+              if (rec?.location?.state_code) state = rec.location.state_code;
+              if (rec?.location?.zip5) zip = rec.location.zip5;
+              if (Array.isArray(rec?.business_categories)) categories = rec.business_categories;
+              const popCity = detail.place_of_performance?.city_name || '';
+              const popState = detail.place_of_performance?.state_code || state;
+              popLocation = [popCity, popState].filter(Boolean).join(', ');
+
+              const officerName = (detail.executive_details?.officers || []).find((o) => o?.name)?.name || '';
+              if (officerName) {
+                contactPerson = officerName.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+                jobTitle = 'Executive Officer';
+              }
+
+              const endDt = String(
+                detail.period_of_performance?.end_date || detail.period_of_performance?.potential_end_date || '',
+              ).slice(0, 10);
+              if (endDt) {
+                liveStatus = endDt >= todayIso ? `Live Won Project (ends ${endDt})` : `Completed Award (ended ${endDt})`;
+              }
+            } catch {
+              // Proceed cleanly with search-level fields if individual award detail times out
+            }
           }
-        } catch {
-          // Proceed cleanly with search-level fields if individual award detail times out
+
+          const awardId = String(row['Award ID'] || '');
+          const amount =
+            typeof row['Award Amount'] === 'number'
+              ? `$${Math.round(row['Award Amount']).toLocaleString('en-US')}`
+              : '';
+          const desc = String(row['Description'] || '');
+          const agency = String(row['Awarding Agency'] || '');
+          const startDt = String(row['Start Date'] || '').slice(0, 10);
+          const sourceUrl = genId
+            ? `https://www.usaspending.gov/award/${genId}`
+            : 'https://www.usaspending.gov/search';
+
+          naicsLeads.push(
+            buildNormalizedLead({
+              company_name: recipientName,
+              contact_person: contactPerson,
+              job_title: jobTitle,
+              city: city ? city.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()) : '',
+              state,
+              zip_code: zip,
+              company_category: categoryLabel,
+              services_offered: categories.slice(0, 4).join(', '),
+              service_opportunity: inferServiceOpportunity(`${naics} ${categoryLabel} ${desc}`),
+              project_name: awardId ? `Federal Award ${awardId}` : 'Federal Construction Award',
+              project_description: desc.slice(0, 450),
+              project_location: popLocation,
+              project_status: liveStatus,
+              project_source_url: sourceUrl,
+              company_source_url: sourceUrl,
+              buying_intent_evidence: [
+                awardId ? `Federal award ${awardId}` : 'Federal award',
+                amount ? `Value: ${amount}` : '',
+                agency ? `Agency: ${agency}` : '',
+                startDt ? `Start: ${startDt}` : '',
+                liveStatus,
+              ]
+                .filter(Boolean)
+                .join('; '),
+              source_name: 'USASpending.gov',
+            }),
+          );
         }
+        return naicsLeads;
+      } catch {
+        return [] as Lead[];
       }
+    }),
+  );
 
-      const awardId = String(row['Award ID'] || '');
-      const amount = typeof row['Award Amount'] === 'number' ? `$${Math.round(row['Award Amount']).toLocaleString('en-US')}` : '';
-      const desc = String(row['Description'] || '');
-      const agency = String(row['Awarding Agency'] || '');
-      const startDt = String(row['Start Date'] || '');
-      const sourceUrl = genId
-        ? `https://www.usaspending.gov/award/${genId}`
-        : 'https://www.usaspending.gov/search';
-
-      leads.push(
-        buildNormalizedLead({
-          company_name: recipientName,
-          contact_person: contactPerson,
-          job_title: jobTitle,
-          city: city ? city.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()) : '',
-          state,
-          zip_code: zip,
-          company_category: categoryLabel,
-          services_offered: categories.slice(0, 4).join(', '),
-          service_opportunity: inferServiceOpportunity(`${naics} ${desc}`),
-          project_name: awardId ? `Federal Award ${awardId}` : 'Federal Construction Award',
-          project_description: desc.slice(0, 450),
-          project_location: popLocation,
-          project_status: liveStatus,
-          project_source_url: sourceUrl,
-          company_source_url: sourceUrl,
-          buying_intent_evidence: [
-            awardId ? `Federal award ${awardId}` : 'Federal award',
-            amount ? `Value: ${amount}` : '',
-            agency ? `Agency: ${agency}` : '',
-            startDt ? `Start: ${startDt}` : '',
-            liveStatus,
-          ]
-            .filter(Boolean)
-            .join('; '),
-          source_name: 'USASpending.gov',
-        }),
-      );
-    }
-  }
-
-  return leads;
+  return naicsResults.flat();
 }
 
-async function discoverMunicipalPermits(limitPerCity: number): Promise<Lead[]> {
-  const leads: Lead[] = [];
-  const cap = Math.max(1, Math.min(20, limitPerCity));
+function parseDallasContractorField(raw: string): { company: string; phone: string } {
+  const phoneMatch = raw.match(/(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}/);
+  const phone = phoneMatch ? phoneMatch[0].trim() : '';
+  let company = raw;
+  if (phoneMatch && typeof phoneMatch.index === 'number') {
+    company = raw.slice(0, phoneMatch.index).trim();
+  }
+  // Strip trailing street/PO Box address segments from Dallas contractor string
+  company = company
+    .replace(/\s+\b(?:PO\s+BOX|P\.O\.\s+BOX|\d{2,5}\s+[A-Z0-9])/i, ' |SPLIT| ')
+    .split('|SPLIT|')[0]
+    .replace(/[,.\-\s]+$/, '')
+    .trim();
+  return { company: company || raw.trim(), phone };
+}
 
-  // Austin, TX Open Data Permits
-  try {
-    const austinUrl = `https://data.austintexas.gov/resource/3syk-w9eu.json?$where=${encodeURIComponent(
-      'contractor_company_name IS NOT NULL',
-    )}&$order=${encodeURIComponent('issue_date DESC')}&$limit=${cap}`;
-    const rows = (await fetchJsonWithTimeout(austinUrl)) as Array<Record<string, unknown>>;
-    for (const row of rows) {
-      const company = String(row.contractor_company_name || '').trim();
-      if (!company) continue;
-      const permitNum = String(row.permit_number || '').trim();
-      const workClass = String(row.work_class || row.permit_type_desc || '').trim();
-      const desc = String(row.description || '').trim();
-      const issueDate = String(row.issue_date || '').slice(0, 10);
-      const expiresDate = String(row.expiresdate || '').slice(0, 10);
-      const loc = String(row.permit_location || row.original_address1 || '').trim();
-      const rawStatus = String(row.status_current || 'Active').trim();
-      const projectStatus = expiresDate
-        ? `Live ${rawStatus} Permit (expires ${expiresDate})`
-        : `Live ${rawStatus} Permit`;
-      const portalUrl = permitNum
-        ? `https://data.austintexas.gov/resource/3syk-w9eu.json?permit_number=${encodeURIComponent(permitNum)}`
-        : 'https://data.austintexas.gov/d/3syk-w9eu';
+async function discoverMunicipalPermits(
+  limitPerPortal: number,
+  page = 1,
+  stateFilter = '',
+  smsPhonePriority = false,
+): Promise<{ leads: Lead[]; portalsUsed: string[] }> {
+  const cap = Math.max(1, Math.min(350, limitPerPortal));
+  const offset = Math.max(0, (Math.max(1, page) - 1) * cap);
+  const portalsUsed: string[] = [];
 
-      leads.push(
-        buildNormalizedLead({
-          company_name: company,
-          business_phone: String(row.contractor_phone || ''),
-          contact_person: String(row.contractor_full_name || '').trim(),
-          job_title: String(row.contractor_trade || 'Project Contractor').trim(),
-          city: String(row.contractor_city || 'Austin'),
-          state: String(row.contractor_state || 'TX'),
-          zip_code: String(row.contractor_zip || row.original_zip || ''),
-          company_category: String(row.permit_class_mapped || 'Building Permit Contractor'),
-          service_opportunity: inferServiceOpportunity(`${workClass} ${desc}`),
-          project_name: permitNum ? `Austin Permit ${permitNum}` : 'Austin Building Permit',
-          project_description: [workClass, desc].filter(Boolean).join(': ').slice(0, 450),
-          project_location: [loc, 'Austin, TX'].filter(Boolean).join(', '),
-          project_status: projectStatus,
-          project_source_url: portalUrl,
-          company_source_url: 'https://data.austintexas.gov/d/3syk-w9eu',
-          buying_intent_evidence: `Active Austin building permit ${permitNum} issued ${issueDate}`.trim(),
-          source_name: 'Austin Open Permits',
-        }),
-      );
-    }
-  } catch {
-    // Allow Chicago to still succeed if Austin is temporarily unreachable
+  const tasks: Array<Promise<Lead[]>> = [];
+
+  // 1. Austin, TX Open Data Permits (has contractor_phone + Building Permits)
+  if (!stateFilter || stateFilter === 'TX') {
+    tasks.push(
+      (async () => {
+        try {
+          const whereClause = smsPhonePriority
+            ? "contractor_company_name IS NOT NULL AND contractor_phone IS NOT NULL AND permittype='BP'"
+            : 'contractor_company_name IS NOT NULL';
+          const austinUrl = `https://data.austintexas.gov/resource/3syk-w9eu.json?$where=${encodeURIComponent(
+            whereClause,
+          )}&$order=${encodeURIComponent('issue_date DESC')}&$limit=${cap}&$offset=${offset}`;
+          const rows = (await fetchJsonWithTimeout(austinUrl, {}, 12000)) as Array<Record<string, unknown>>;
+          const out: Lead[] = [];
+          for (const row of rows) {
+            const company = String(row.contractor_company_name || '').trim();
+            if (!company) continue;
+            const permitNum = String(row.permit_number || '').trim();
+            const workClass = String(row.work_class || row.permit_type_desc || '').trim();
+            const desc = String(row.description || '').trim();
+            const issueDate = String(row.issue_date || '').slice(0, 10);
+            const expiresDate = String(row.expiresdate || '').slice(0, 10);
+            const loc = String(row.permit_location || row.original_address1 || '').trim();
+            const valuation = Number.parseFloat(String(row.total_job_valuation || '0'));
+            const valText = Number.isFinite(valuation) && valuation > 100 ? ` · Value: $${Math.round(valuation).toLocaleString('en-US')}` : '';
+            const rawStatus = String(row.status_current || 'Active').trim();
+            const projectStatus = expiresDate
+              ? `Live ${rawStatus} Permit (expires ${expiresDate})`
+              : `Live ${rawStatus} Permit`;
+            const portalUrl = permitNum
+              ? `https://data.austintexas.gov/resource/3syk-w9eu.json?permit_number=${encodeURIComponent(permitNum)}`
+              : 'https://data.austintexas.gov/d/3syk-w9eu';
+
+            out.push(
+              buildNormalizedLead({
+                company_name: company,
+                business_phone: String(row.contractor_phone || row.applicant_phone || ''),
+                contact_person: String(row.contractor_full_name || row.applicant_full_name || '').trim(),
+                job_title: String(row.contractor_trade || 'Project Contractor').trim(),
+                city: String(row.contractor_city || 'Austin'),
+                state: String(row.contractor_state || 'TX'),
+                zip_code: String(row.contractor_zip || row.original_zip || ''),
+                company_category: String(row.permit_class_mapped || 'Building Permit Contractor'),
+                service_opportunity: inferServiceOpportunity(`${workClass} ${desc}`),
+                project_name: permitNum ? `Austin Permit ${permitNum}` : 'Austin Building Permit',
+                project_description: [workClass, desc].filter(Boolean).join(': ').slice(0, 450),
+                project_location: [loc, 'Austin, TX'].filter(Boolean).join(', '),
+                project_status: projectStatus,
+                project_source_url: portalUrl,
+                company_source_url: 'https://data.austintexas.gov/d/3syk-w9eu',
+                buying_intent_evidence: `Active Austin permit ${permitNum} issued ${issueDate}${valText}`.trim(),
+                source_name: 'Austin Open Permits',
+              }),
+            );
+          }
+          if (out.length > 0) portalsUsed.push('Austin TX');
+          return out;
+        } catch {
+          return [];
+        }
+      })(),
+    );
   }
 
-  // Chicago, IL Building Permits
-  try {
-    const chicagoUrl = `https://data.cityofchicago.org/resource/ydr8-5enu.json?$where=${encodeURIComponent(
-      "contact_1_name IS NOT NULL AND contact_1_type LIKE '%CONTRACTOR%'",
-    )}&$order=${encodeURIComponent('issue_date DESC')}&$limit=${cap}`;
-    const rows = (await fetchJsonWithTimeout(chicagoUrl)) as Array<Record<string, unknown>>;
-    for (const row of rows) {
-      const company = String(row.contact_1_name || '').trim();
-      if (!company) continue;
-      const permitNum = String(row.permit_ || row.id || '').trim();
-      const desc = String(row.work_description || '').trim();
-      const issueDate = String(row.issue_date || '').slice(0, 10);
-      const cost = String(row.reported_cost || '').trim();
-      const street = [row.street_number, row.street_direction, row.street_name]
-        .map((v) => String(v || '').trim())
-        .filter(Boolean)
-        .join(' ');
-      const portalUrl = permitNum
-        ? `https://data.cityofchicago.org/resource/ydr8-5enu.json?permit_=${encodeURIComponent(permitNum)}`
-        : 'https://data.cityofchicago.org/d/ydr8-5enu';
+  // 2. NYC DOB Issued Permits (has permittee_s_phone__ + permittee_s_business_name)
+  if (!stateFilter || stateFilter === 'NY') {
+    tasks.push(
+      (async () => {
+        try {
+          const whereClause =
+            'permittee_s_business_name IS NOT NULL AND permittee_s_phone__ IS NOT NULL';
+          const nycUrl = `https://data.cityofnewyork.us/resource/ipu4-2q9a.json?$where=${encodeURIComponent(
+            whereClause,
+          )}&$order=${encodeURIComponent('issuance_date DESC')}&$limit=${cap}&$offset=${offset}`;
+          const rows = (await fetchJsonWithTimeout(nycUrl, {}, 12000)) as Array<Record<string, unknown>>;
+          const out: Lead[] = [];
+          for (const row of rows) {
+            const company = String(row.permittee_s_business_name || '').trim();
+            if (!company || company === 'N/A' || company === 'NONE') continue;
+            const jobNum = String(row.job__ || row.permit_si_no || '').trim();
+            const jobType = String(row.job_type || '').trim();
+            const workType = String(row.work_type || '').trim();
+            const borough = String(row.borough || row.city || 'New York').trim();
+            const street = [row.house__, row.street_name]
+              .map((v) => String(v || '').trim())
+              .filter(Boolean)
+              .join(' ');
+            const fullName = [row.permittee_s_first_name, row.permittee_s_last_name]
+              .map((v) => String(v || '').trim())
+              .filter(Boolean)
+              .join(' ');
+            const licType = String(row.permittee_s_license_type || 'GC').trim();
+            const expDate = String(row.expiration_date || '').trim();
+            const issDate = String(row.issuance_date || '').trim();
+            const status = String(row.permit_status || 'ISSUED').trim();
 
-      leads.push(
-        buildNormalizedLead({
-          company_name: company,
-          city: String(row.contact_1_city || 'Chicago'),
-          state: String(row.contact_1_state || 'IL'),
-          zip_code: String(row.contact_1_zipcode || ''),
-          company_category: String(row.contact_1_type || 'Contractor'),
-          service_opportunity: inferServiceOpportunity(desc),
-          project_name: permitNum ? `Chicago Permit ${permitNum}` : 'Chicago Building Permit',
-          project_description: desc.slice(0, 450),
-          project_location: [street, 'Chicago, IL'].filter(Boolean).join(', '),
-          project_status: 'Live Issued Permit',
-          project_source_url: portalUrl,
-          company_source_url: 'https://data.cityofchicago.org/d/ydr8-5enu',
-          buying_intent_evidence: `Chicago permit ${permitNum} issued ${issueDate}${cost ? ` (reported cost $${cost})` : ''}`.trim(),
-          source_name: 'Chicago Building Permits',
-        }),
-      );
-    }
-  } catch {
-    // Allow partial results
+            out.push(
+              buildNormalizedLead({
+                company_name: company,
+                business_phone: String(row.permittee_s_phone__ || ''),
+                contact_person: fullName ? fullName.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()) : '',
+                job_title: licType === 'GC' ? 'Licensed General Contractor' : `Permittee (${licType})`,
+                city: borough ? borough.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()) : 'New York',
+                state: 'NY',
+                zip_code: String(row.zip_code || row.owner_s_zip_code || ''),
+                company_category: licType === 'GC' ? 'NYC General Contractor' : `NYC ${licType} Contractor`,
+                service_opportunity: inferServiceOpportunity(`architectural permit drawings ${jobType} ${workType} ${licType}`),
+                project_name: jobNum ? `NYC DOB Job ${jobNum}` : 'NYC DOB Building Permit',
+                project_description: `NYC DOB ${jobType || 'Alteration'} (${workType || 'General'}) permit at ${street || borough}`,
+                project_location: [street, borough, 'NY'].filter(Boolean).join(', '),
+                project_status: expDate ? `Live ${status} Permit (exp ${expDate})` : `Live ${status} Permit`,
+                project_source_url: jobNum
+                  ? `https://data.cityofnewyork.us/resource/ipu4-2q9a.json?job__=${encodeURIComponent(jobNum)}`
+                  : 'https://data.cityofnewyork.us/d/ipu4-2q9a',
+                company_source_url: 'https://data.cityofnewyork.us/d/ipu4-2q9a',
+                buying_intent_evidence: `NYC DOB permit ${jobNum} issued ${issDate} (${licType})`.trim(),
+                source_name: 'NYC DOB Permits',
+              }),
+            );
+          }
+          if (out.length > 0) portalsUsed.push('NYC DOB');
+          return out;
+        } catch {
+          return [];
+        }
+      })(),
+    );
   }
 
-  return leads;
+  // 3. Dallas, TX Building Permits (often embeds contractor phone + project dollar value)
+  if (!stateFilter || stateFilter === 'TX') {
+    tasks.push(
+      (async () => {
+        try {
+          const dallasUrl = `https://www.dallasopendata.com/resource/e7gq-4sah.json?$where=${encodeURIComponent(
+            'contractor IS NOT NULL',
+          )}&$order=${encodeURIComponent('issued_date DESC')}&$limit=${cap}&$offset=${offset}`;
+          const rows = (await fetchJsonWithTimeout(dallasUrl, {}, 12000)) as Array<Record<string, unknown>>;
+          const out: Lead[] = [];
+          for (const row of rows) {
+            const rawContractor = String(row.contractor || '').trim();
+            if (!rawContractor) continue;
+            const { company, phone } = parseDallasContractorField(rawContractor);
+            if (!company || company.length < 3) continue;
+            if (smsPhonePriority && !phone) continue;
+
+            const permitNum = String(row.permit_number || '').trim();
+            const permitType = String(row.permit_type || '').trim();
+            const desc = String(row.work_description || '').trim();
+            const issued = String(row.issued_date || '').trim();
+            const valNum = Number.parseFloat(String(row.value || '0').replace(/,/g, ''));
+            const valText = Number.isFinite(valNum) && valNum > 0 ? ` · Value: $${Math.round(valNum).toLocaleString('en-US')}` : '';
+
+            out.push(
+              buildNormalizedLead({
+                company_name: company,
+                business_phone: phone,
+                city: 'Dallas',
+                state: 'TX',
+                zip_code: String(row.zip_code || ''),
+                company_category: permitType || 'Dallas Building Contractor',
+                service_opportunity: inferServiceOpportunity(`${permitType} ${desc}`),
+                project_name: permitNum ? `Dallas Permit ${permitNum}` : 'Dallas Building Permit',
+                project_description: [permitType, desc].filter(Boolean).join(': ').slice(0, 450),
+                project_location: String(row.street_address || 'Dallas, TX'),
+                project_status: 'Live Issued Permit',
+                project_source_url: permitNum
+                  ? `https://www.dallasopendata.com/resource/e7gq-4sah.json?permit_number=${encodeURIComponent(permitNum)}`
+                  : 'https://www.dallasopendata.com/d/e7gq-4sah',
+                company_source_url: 'https://www.dallasopendata.com/d/e7gq-4sah',
+                buying_intent_evidence: `Dallas permit ${permitNum} issued ${issued}${valText}`.trim(),
+                source_name: 'Dallas Building Permits',
+              }),
+            );
+          }
+          if (out.length > 0) portalsUsed.push('Dallas TX');
+          return out;
+        } catch {
+          return [];
+        }
+      })(),
+    );
+  }
+
+  // 4. NYC DOB NOW Approved (fresh 2025/2026 filings with job costs)
+  if ((!stateFilter || stateFilter === 'NY') && !smsPhonePriority) {
+    tasks.push(
+      (async () => {
+        try {
+          const dobNowUrl = `https://data.cityofnewyork.us/resource/rbx6-tga4.json?$where=${encodeURIComponent(
+            'applicant_business_name IS NOT NULL',
+          )}&$order=${encodeURIComponent('approved_date DESC')}&$limit=${Math.min(150, cap)}&$offset=${offset}`;
+          const rows = (await fetchJsonWithTimeout(dobNowUrl, {}, 12000)) as Array<Record<string, unknown>>;
+          const out: Lead[] = [];
+          for (const row of rows) {
+            const company = String(row.applicant_business_name || '').trim();
+            if (!company) continue;
+            const jobNum = String(row.tracking_number || row.job_filing_number || '').trim();
+            const desc = String(row.job_description || '').trim();
+            const workType = String(row.work_type || '').trim();
+            const costNum = Number.parseFloat(String(row.estimated_job_costs || '0'));
+            const costText = Number.isFinite(costNum) && costNum > 0 ? ` · Value: $${Math.round(costNum).toLocaleString('en-US')}` : '';
+            const borough = String(row.borough || 'New York').trim();
+            const contact = [row.applicant_first_name, row.applicant_last_name]
+              .map((v) => String(v || '').trim())
+              .filter(Boolean)
+              .join(' ');
+            const street = [row.house_no, row.street_name]
+              .map((v) => String(v || '').trim())
+              .filter(Boolean)
+              .join(' ');
+
+            out.push(
+              buildNormalizedLead({
+                company_name: company,
+                contact_person: contact ? contact.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()) : '',
+                job_title: String(row.permittee_s_license_type || 'Applicant / GC'),
+                city: borough,
+                state: 'NY',
+                zip_code: String(row.zip_code || ''),
+                company_category: workType || 'NYC DOB NOW Builder',
+                service_opportunity: inferServiceOpportunity(`architectural permit set ${workType} ${desc}`),
+                project_name: jobNum ? `NYC DOB NOW ${jobNum}` : 'NYC DOB NOW Permit',
+                project_description: [workType, desc].filter(Boolean).join(': ').slice(0, 450),
+                project_location: [street, borough, 'NY'].filter(Boolean).join(', '),
+                project_status: `Live ${String(row.permit_status || 'Approved')}`,
+                project_source_url: 'https://data.cityofnewyork.us/d/rbx6-tga4',
+                company_source_url: 'https://data.cityofnewyork.us/d/rbx6-tga4',
+                buying_intent_evidence: `NYC DOB NOW filing ${jobNum} (${String(row.approved_date || '').slice(0, 10)})${costText}`.trim(),
+                source_name: 'NYC DOB NOW',
+              }),
+            );
+          }
+          if (out.length > 0) portalsUsed.push('NYC DOB NOW');
+          return out;
+        } catch {
+          return [];
+        }
+      })(),
+    );
+  }
+
+  // 5. Chicago, IL Building Permits (Contractors + Architects)
+  if ((!stateFilter || stateFilter === 'IL') && !smsPhonePriority) {
+    tasks.push(
+      (async () => {
+        try {
+          const chicagoUrl = `https://data.cityofchicago.org/resource/ydr8-5enu.json?$where=${encodeURIComponent(
+            "contact_1_name IS NOT NULL AND (contact_1_type LIKE '%CONTRACTOR%' OR contact_1_type LIKE '%ARCHITECT%')",
+          )}&$order=${encodeURIComponent('issue_date DESC')}&$limit=${Math.min(200, cap)}&$offset=${offset}`;
+          const rows = (await fetchJsonWithTimeout(chicagoUrl, {}, 12000)) as Array<Record<string, unknown>>;
+          const out: Lead[] = [];
+          for (const row of rows) {
+            const company = String(row.contact_1_name || '').trim();
+            if (!company) continue;
+            const permitNum = String(row.permit_ || row.id || '').trim();
+            const desc = String(row.work_description || '').trim();
+            const issueDate = String(row.issue_date || '').slice(0, 10);
+            const cost = String(row.reported_cost || '').trim();
+            const street = [row.street_number, row.street_direction, row.street_name]
+              .map((v) => String(v || '').trim())
+              .filter(Boolean)
+              .join(' ');
+            const portalUrl = permitNum
+              ? `https://data.cityofchicago.org/resource/ydr8-5enu.json?permit_=${encodeURIComponent(permitNum)}`
+              : 'https://data.cityofchicago.org/d/ydr8-5enu';
+
+            out.push(
+              buildNormalizedLead({
+                company_name: company,
+                city: String(row.contact_1_city || 'Chicago'),
+                state: String(row.contact_1_state || 'IL'),
+                zip_code: String(row.contact_1_zipcode || ''),
+                company_category: String(row.contact_1_type || 'Contractor'),
+                service_opportunity: inferServiceOpportunity(`${String(row.contact_1_type || '')} ${desc}`),
+                project_name: permitNum ? `Chicago Permit ${permitNum}` : 'Chicago Building Permit',
+                project_description: desc.slice(0, 450),
+                project_location: [street, 'Chicago, IL'].filter(Boolean).join(', '),
+                project_status: 'Live Issued Permit',
+                project_source_url: portalUrl,
+                company_source_url: 'https://data.cityofchicago.org/d/ydr8-5enu',
+                buying_intent_evidence: `Chicago permit ${permitNum} issued ${issueDate}${cost ? ` (reported cost $${cost})` : ''}`.trim(),
+                source_name: 'Chicago Building Permits',
+              }),
+            );
+          }
+          if (out.length > 0) portalsUsed.push('Chicago IL');
+          return out;
+        } catch {
+          return [];
+        }
+      })(),
+    );
+  }
+
+  const settled = await Promise.all(tasks);
+  return { leads: settled.flat(), portalsUsed };
 }
 
 const PRIORITY_EMAIL_PREFIXES = [
@@ -840,32 +1107,59 @@ async function startServer() {
     try {
       const source = String(req.body?.source || 'all');
       const state = String(req.body?.state || '').trim().toUpperCase().slice(0, 2);
-      const limit = Number.isFinite(Number(req.body?.limit)) ? Math.max(1, Math.min(15, Number(req.body.limit))) : 3;
+      const limit = Number.isFinite(Number(req.body?.limit))
+        ? Math.max(1, Math.min(350, Number(req.body.limit)))
+        : 3;
+      const page = Number.isFinite(Number(req.body?.page))
+        ? Math.max(1, Math.min(50, Number(req.body.page)))
+        : 1;
+      const smsPhonePriority = Boolean(req.body?.smsPhonePriority);
 
       const allLeads: Lead[] = [];
       const sourcesRun: string[] = [];
       const warnings: string[] = [];
 
-      if (source === 'all' || source === 'usaspending') {
-        try {
-          const usaLeads = await discoverUsaSpending(state, Math.min(5, limit));
-          allLeads.push(...usaLeads);
-          sourcesRun.push('USASpending.gov');
-        } catch (err) {
-          warnings.push(`USASpending.gov unavailable: ${err instanceof Error ? err.message : 'Network error'}`);
-        }
+      const tasks: Array<Promise<void>> = [];
+
+      if ((source === 'all' || source === 'usaspending') && !smsPhonePriority) {
+        tasks.push(
+          (async () => {
+            try {
+              const usaCap = limit >= 50 ? Math.min(60, Math.ceil(limit / 4)) : Math.min(5, limit);
+              const usaLeads = await discoverUsaSpending(state, usaCap, page);
+              allLeads.push(...usaLeads);
+              sourcesRun.push('USASpending.gov');
+            } catch (err) {
+              warnings.push(`USASpending.gov unavailable: ${err instanceof Error ? err.message : 'Network error'}`);
+            }
+          })(),
+        );
       }
 
-      if (source === 'all' || source === 'permits') {
-        try {
-          const permitLeads = await discoverMunicipalPermits(limit * 2);
-          const filtered = state ? permitLeads.filter((l) => !l.state || l.state === state) : permitLeads;
-          allLeads.push(...filtered);
-          sourcesRun.push('Municipal Permits (Austin & Chicago)');
-        } catch (err) {
-          warnings.push(`Municipal Permits unavailable: ${err instanceof Error ? err.message : 'Network error'}`);
-        }
+      if (source === 'all' || source === 'permits' || smsPhonePriority) {
+        tasks.push(
+          (async () => {
+            try {
+              const portalCap = limit >= 50 ? limit : limit * 4;
+              const { leads: permitLeads, portalsUsed } = await discoverMunicipalPermits(
+                portalCap,
+                page,
+                state,
+                smsPhonePriority,
+              );
+              const filtered = state ? permitLeads.filter((l) => !l.state || l.state === state) : permitLeads;
+              allLeads.push(...filtered);
+              if (portalsUsed.length > 0) {
+                sourcesRun.push(`Permits (${portalsUsed.join(', ')})`);
+              }
+            } catch (err) {
+              warnings.push(`Municipal Permits unavailable: ${err instanceof Error ? err.message : 'Network error'}`);
+            }
+          })(),
+        );
       }
+
+      await Promise.all(tasks);
 
       res.json({
         leads: allLeads,
@@ -1038,6 +1332,242 @@ async function startServer() {
       });
     } catch (err) {
       return res.status(500).json({ error: err instanceof Error ? err.message : 'Batch contact lookup failed' });
+    }
+  });
+
+  app.get('/api/crm/status', (_req, res) => {
+    res.json({
+      configured: {
+        hubspot: Boolean(process.env.HUBSPOT_ACCESS_TOKEN?.trim()),
+        salesforce: Boolean(
+          process.env.SALESFORCE_INSTANCE_URL?.trim() && process.env.SALESFORCE_ACCESS_TOKEN?.trim(),
+        ),
+        pipedrive: Boolean(process.env.PIPEDRIVE_API_TOKEN?.trim()),
+        zoho: Boolean(process.env.ZOHO_CRM_ACCESS_TOKEN?.trim()),
+        webhook: Boolean(process.env.CRM_WEBHOOK_URL?.trim()),
+      },
+    });
+  });
+
+  app.post('/api/crm/sync', async (req, res) => {
+    try {
+      const platform = String(req.body?.platform || '') as CrmPlatform;
+      const validPlatforms: CrmPlatform[] = ['hubspot', 'salesforce', 'pipedrive', 'zoho', 'webhook'];
+      if (!validPlatforms.includes(platform)) {
+        return res.status(400).json({ error: 'Unsupported CRM platform.' });
+      }
+
+      const rawLeads = Array.isArray(req.body?.leads) ? req.body.leads : [];
+      if (rawLeads.length === 0) {
+        return res.status(400).json({ error: 'Select at least one lead to sync.' });
+      }
+      const normalizedLeads = rawLeads
+        .slice(0, 100)
+        .map((item: Partial<Lead>) => buildNormalizedLead(item));
+      const records = mapLeadsToCrmRecords(normalizedLeads, platform);
+
+      if (platform === 'webhook') {
+        const rawUrl = String(req.body?.webhookUrl || process.env.CRM_WEBHOOK_URL || '').trim();
+        if (!rawUrl) {
+          return res.status(400).json({
+            error: 'Provide a public HTTPS webhook URL or set CRM_WEBHOOK_URL in server Secrets.',
+          });
+        }
+        const safeUrl = await assertSafePublicUrl(rawUrl);
+        const resp = await fetch(safeUrl.toString(), {
+          method: 'POST',
+          signal: AbortSignal.timeout(12000),
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': USER_AGENT,
+          },
+          body: JSON.stringify({
+            source: 'Ai Leads Hunter',
+            platform: 'webhook',
+            synced_at: new Date().toISOString(),
+            count: records.length,
+            records,
+          }),
+        });
+        if (!resp.ok) {
+          return res.status(502).json({
+            error: `Webhook endpoint returned HTTP ${resp.status}.`,
+          });
+        }
+        return res.json({
+          ok: true,
+          platform,
+          syncedCount: records.length,
+          failedCount: 0,
+          message: `Synced ${records.length} lead(s) to ${safeUrl.hostname}.`,
+        });
+      }
+
+      if (platform === 'hubspot') {
+        const token = process.env.HUBSPOT_ACCESS_TOKEN?.trim();
+        if (!token) {
+          return res.status(400).json({
+            error: 'HUBSPOT_ACCESS_TOKEN is not configured in server Secrets. Export HubSpot CSV/JSON or add the secret on the server.',
+          });
+        }
+        const inputs = records.map((rec) => ({
+          properties: {
+            company: String(rec.company || ''),
+            firstname: String(rec.firstname || ''),
+            lastname: String(rec.lastname || ''),
+            jobtitle: String(rec.jobtitle || ''),
+            email: String(rec.email || ''),
+            phone: String(rec.phone || ''),
+            website: String(rec.website || ''),
+            city: String(rec.city || ''),
+            state: String(rec.state || ''),
+            zip: String(rec.zip || ''),
+            hs_lead_status: String(rec.hs_lead_status || 'NEW'),
+          },
+        }));
+        const resp = await fetch('https://api.hubapi.com/crm/v3/objects/contacts/batch/create', {
+          method: 'POST',
+          signal: AbortSignal.timeout(12000),
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ inputs }),
+        });
+        if (!resp.ok) {
+          return res.status(502).json({ error: `HubSpot API returned HTTP ${resp.status}.` });
+        }
+        const data = (await resp.json()) as { results?: unknown[] };
+        const synced = Array.isArray(data.results) ? data.results.length : records.length;
+        return res.json({
+          ok: true,
+          platform,
+          syncedCount: synced,
+          failedCount: Math.max(0, records.length - synced),
+          message: `Synced ${synced} contact(s) to HubSpot.`,
+        });
+      }
+
+      if (platform === 'salesforce') {
+        const instanceRaw = process.env.SALESFORCE_INSTANCE_URL?.trim();
+        const token = process.env.SALESFORCE_ACCESS_TOKEN?.trim();
+        if (!instanceRaw || !token) {
+          return res.status(400).json({
+            error: 'SALESFORCE_INSTANCE_URL and SALESFORCE_ACCESS_TOKEN must be set in server Secrets.',
+          });
+        }
+        const safeInstance = await assertSafePublicUrl(instanceRaw);
+        const sfRecords = records.map((rec) => ({
+          attributes: { type: 'Lead' },
+          ...rec,
+        }));
+        const resp = await fetch(`${safeInstance.origin}/services/data/v60.0/composite/sobjects`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(12000),
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ allOrNone: false, records: sfRecords }),
+        });
+        if (!resp.ok) {
+          return res.status(502).json({ error: `Salesforce API returned HTTP ${resp.status}.` });
+        }
+        const results = (await resp.json()) as Array<{ success?: boolean }>;
+        const synced = Array.isArray(results) ? results.filter((r) => r.success).length : records.length;
+        return res.json({
+          ok: true,
+          platform,
+          syncedCount: synced,
+          failedCount: Math.max(0, records.length - synced),
+          message: `Synced ${synced} Lead record(s) to Salesforce.`,
+        });
+      }
+
+      if (platform === 'pipedrive') {
+        const token = process.env.PIPEDRIVE_API_TOKEN?.trim();
+        if (!token) {
+          return res.status(400).json({
+            error: 'PIPEDRIVE_API_TOKEN is not configured in server Secrets.',
+          });
+        }
+        let synced = 0;
+        let failed = 0;
+        for (const rec of records.slice(0, 25)) {
+          try {
+            const orgResp = await fetch(
+              `https://api.pipedrive.com/v1/organizations?api_token=${encodeURIComponent(token)}`,
+              {
+                method: 'POST',
+                signal: AbortSignal.timeout(8000),
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  name: String(rec.organization_name || 'Contractor'),
+                  address: [rec.city, rec.state, rec.zip_code].filter(Boolean).join(', '),
+                }),
+              },
+            );
+            const orgJson = (await orgResp.json()) as { data?: { id?: number } };
+            const orgId = orgJson?.data?.id;
+            if (!orgId) {
+              failed += 1;
+              continue;
+            }
+            const leadResp = await fetch(
+              `https://api.pipedrive.com/v1/leads?api_token=${encodeURIComponent(token)}`,
+              {
+                method: 'POST',
+                signal: AbortSignal.timeout(8000),
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  title: String(rec.lead_title || rec.organization_name || 'Warm Lead'),
+                  organization_id: orgId,
+                }),
+              },
+            );
+            if (leadResp.ok) synced += 1;
+            else failed += 1;
+          } catch {
+            failed += 1;
+          }
+        }
+        return res.json({
+          ok: synced > 0,
+          platform,
+          syncedCount: synced,
+          failedCount: failed,
+          message: `Synced ${synced} lead(s) to Pipedrive${failed ? ` (${failed} skipped)` : ''}.`,
+        });
+      }
+
+      // Zoho CRM
+      const zohoToken = process.env.ZOHO_CRM_ACCESS_TOKEN?.trim();
+      if (!zohoToken) {
+        return res.status(400).json({
+          error: 'ZOHO_CRM_ACCESS_TOKEN is not configured in server Secrets.',
+        });
+      }
+      const zohoResp = await fetch('https://www.zohoapis.com/crm/v2/Leads', {
+        method: 'POST',
+        signal: AbortSignal.timeout(12000),
+        headers: {
+          Authorization: `Zoho-oauthtoken ${zohoToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ data: records }),
+      });
+      if (!zohoResp.ok) {
+        return res.status(502).json({ error: `Zoho CRM API returned HTTP ${zohoResp.status}.` });
+      }
+      return res.json({
+        ok: true,
+        platform,
+        syncedCount: records.length,
+        failedCount: 0,
+        message: `Synced ${records.length} lead(s) to Zoho CRM.`,
+      });
+    } catch (err) {
+      return res.status(400).json({ error: err instanceof Error ? err.message : 'CRM sync failed' });
     }
   });
 

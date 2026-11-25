@@ -1,15 +1,18 @@
 import { Download } from 'lucide-react';
+import { getSmsReadyLeads } from '../lib/leadEngine.ts';
 import type { Lead } from '../types/lead.ts';
 
 interface DailyReportViewProps {
   leads: Lead[];
   onExportCsv: (rows: Lead[], filename: string) => void;
   onExportExcel: (rows: Lead[], filename: string) => void;
+  onExportZoomSms?: (rows: Lead[], filename: string) => void;
 }
 
-export function DailyReportView({ leads, onExportCsv, onExportExcel }: DailyReportViewProps) {
+export function DailyReportView({ leads, onExportCsv, onExportExcel, onExportZoomSms }: DailyReportViewProps) {
   const warmLeads = leads.filter((l) => l.lead_tier === 'Warm');
   const potentialLeads = leads.filter((l) => l.lead_tier === 'Potential');
+  const smsReadyLeads = getSmsReadyLeads(leads);
   const estimationCount = leads.filter((l) => l.service_opportunity === 'Construction Estimation').length;
   const architecturalCount = leads.filter((l) => l.service_opportunity === 'Architectural Services').length;
   const millworkCount = leads.filter((l) => l.service_opportunity === 'Millwork Services').length;
@@ -56,6 +59,17 @@ export function DailyReportView({ leads, onExportCsv, onExportExcel }: DailyRepo
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          {onExportZoomSms && (
+            <button
+              type="button"
+              onClick={() => onExportZoomSms(leads, `zoom_dialer_sms_${new Date().toISOString().slice(0, 10)}.csv`)}
+              disabled={smsReadyLeads.length === 0}
+              className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold text-white bg-amber-600 rounded-md hover:bg-amber-700 disabled:opacity-40 whitespace-nowrap shrink-0"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Zoom SMS CSV ({smsReadyLeads.length})
+            </button>
+          )}
           <button
             type="button"
             onClick={() => onExportCsv(warmLeads, `warm_leads_${new Date().toISOString().slice(0, 10)}.csv`)}

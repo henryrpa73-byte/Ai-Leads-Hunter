@@ -21,6 +21,17 @@ const PRESETS: Array<{ label: string; config: ScoringCriteriaConfig }> = [
     config: DEFAULT_SCORING_CONFIG,
   },
   {
+    label: 'Winter 2D/3D & SMS',
+    config: {
+      warmThreshold: 65,
+      projectValueWeight: 20,
+      companySizeWeight: 15,
+      serviceMatchWeight: 40,
+      activityReachWeight: 25,
+      smsFocus: true,
+    },
+  },
+  {
     label: 'High-Value Projects',
     config: {
       warmThreshold: 70,
@@ -28,6 +39,7 @@ const PRESETS: Array<{ label: string; config: ScoringCriteriaConfig }> = [
       companySizeWeight: 20,
       serviceMatchWeight: 20,
       activityReachWeight: 15,
+      smsFocus: false,
     },
   },
   {
@@ -38,6 +50,7 @@ const PRESETS: Array<{ label: string; config: ScoringCriteriaConfig }> = [
       companySizeWeight: 15,
       serviceMatchWeight: 45,
       activityReachWeight: 20,
+      smsFocus: false,
     },
   },
 ];

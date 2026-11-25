@@ -21,7 +21,7 @@ export function getTodayDateKey(): string {
   return `${y}-${m}-${d}`;
 }
 
-export function createDefaultQuota(discoveryLimit = 300, contactLimit = 300): DailyQuotaState {
+export function createDefaultQuota(discoveryLimit = 1500, contactLimit = 1500): DailyQuotaState {
   return {
     date: getTodayDateKey(),
     discoveryLeadsToday: 0,
@@ -42,8 +42,8 @@ export function loadDailyQuota(): DailyQuotaState {
     const raw = localStorage.getItem(QUOTA_STORAGE_KEY);
     if (!raw) return createDefaultQuota();
     const parsed = JSON.parse(raw) as Partial<DailyQuotaState>;
-    const dLimit = typeof parsed.discoveryLimit === 'number' && parsed.discoveryLimit > 0 ? parsed.discoveryLimit : 300;
-    const cLimit = typeof parsed.contactLimit === 'number' && parsed.contactLimit > 0 ? parsed.contactLimit : 300;
+    const dLimit = typeof parsed.discoveryLimit === 'number' && parsed.discoveryLimit > 0 ? parsed.discoveryLimit : 1500;
+    const cLimit = typeof parsed.contactLimit === 'number' && parsed.contactLimit > 0 ? parsed.contactLimit : 1500;
 
     if (parsed.date !== today) {
       return createDefaultQuota(dLimit, cLimit);
@@ -74,9 +74,15 @@ export function saveDailyQuota(state: DailyQuotaState): void {
   }
 }
 
-export function getEstimatedLeadsPerRun(source: 'all' | 'usaspending' | 'permits', batchLimit: number): number {
-  const usaPerRun = Math.min(5, batchLimit) * 5;
-  const permitsPerRun = Math.min(20, batchLimit * 2) * 2;
+export function getEstimatedLeadsPerRun(
+  source: 'all' | 'usaspending' | 'permits',
+  batchLimit: number,
+  smsPhonePriority = false,
+): number {
+  const usaPerRun = batchLimit >= 50 ? Math.min(60, Math.ceil(batchLimit / 4)) * 8 : Math.min(5, batchLimit) * 8;
+  const portalCount = smsPhonePriority ? 3 : 5;
+  const permitsPerRun = (batchLimit >= 50 ? Math.min(350, batchLimit) : Math.min(350, batchLimit * 4)) * portalCount;
+  if (smsPhonePriority) return permitsPerRun;
   if (source === 'usaspending') return usaPerRun;
   if (source === 'permits') return permitsPerRun;
   return usaPerRun + permitsPerRun;

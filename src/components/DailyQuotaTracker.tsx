@@ -5,6 +5,7 @@ interface DailyQuotaTrackerProps {
   quota: DailyQuotaState;
   huntSource: 'all' | 'usaspending' | 'permits';
   huntLimit: number;
+  smsPhonePriority?: boolean;
   onChangeDailyTier: (dailyLimit: number) => void;
   onResetToday: () => void;
 }
@@ -19,6 +20,7 @@ export function DailyQuotaTracker({
   quota,
   huntSource,
   huntLimit,
+  smsPhonePriority = false,
   onChangeDailyTier,
   onResetToday,
 }: DailyQuotaTrackerProps) {
@@ -28,7 +30,7 @@ export function DailyQuotaTracker({
   const contactRemaining = Math.max(0, quota.contactLimit - quota.contactChecksToday);
   const contactPct = Math.min(100, Math.round((quota.contactChecksToday / Math.max(1, quota.contactLimit)) * 100));
 
-  const estPerRun = getEstimatedLeadsPerRun(huntSource, huntLimit);
+  const estPerRun = getEstimatedLeadsPerRun(huntSource, huntLimit, smsPhonePriority);
   const runsRemaining = estPerRun > 0 ? Math.floor(discoveryRemaining / estPerRun) : 0;
 
   const hasAnyUsage =
@@ -61,11 +63,12 @@ export function DailyQuotaTracker({
             onChange={(e) => onChangeDailyTier(Number(e.target.value))}
             className="h-7 px-2 text-xs bg-white border border-slate-200 rounded text-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-900"
           >
-            <option value={100}>Starter (100 / day)</option>
             <option value={150}>Conservative (150 / day)</option>
             <option value={300}>Standard (300 / day)</option>
             <option value={500}>Growth (500 / day)</option>
-            <option value={1000}>High Volume (1,000 / day)</option>
+            <option value={1000}>SMS Scale (1,000 / day)</option>
+            <option value={1500}>High Volume (1,500 / day)</option>
+            <option value={2000}>Max SMS Daily (2,000 / day)</option>
           </select>
 
           {hasAnyUsage && (

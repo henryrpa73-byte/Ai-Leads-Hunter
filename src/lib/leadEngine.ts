@@ -157,7 +157,11 @@ export function inferServiceOpportunity(text: string): string {
   if (/(millwork|cabinet|casework|woodwork|finish carpentry|337110|238350)/.test(low)) {
     return 'Millwork Services';
   }
-  if (/(architect|cad|drafting|permit drawing|construction drawing|design-build|541310|tenant finish)/.test(low)) {
+  if (
+    /(architect|cad|drafting|permit drawing|permit set|cd set|construction drawing|floor plan|site plan|elevation|3d|rendering|design-build|new construction|remodel|renovation|addition|tenant finish|541310|541330|541340)/.test(
+      low,
+    )
+  ) {
     return 'Architectural Services';
   }
   return 'Construction Estimation';
@@ -169,6 +173,7 @@ export interface ScoringCriteriaConfig {
   companySizeWeight: number;
   serviceMatchWeight: number;
   activityReachWeight: number;
+  smsFocus?: boolean;
 }
 
 export const DEFAULT_SCORING_CONFIG: ScoringCriteriaConfig = {
@@ -177,6 +182,7 @@ export const DEFAULT_SCORING_CONFIG: ScoringCriteriaConfig = {
   companySizeWeight: 20,
   serviceMatchWeight: 30,
   activityReachWeight: 20,
+  smsFocus: false,
 };
 
 export function extractProjectValueUsd(text: string): number | null {
@@ -374,8 +380,8 @@ export function scoreLead(
     actRatio += 0.12;
   }
   if (input.phone_digits) {
-    actRatio += 0.15;
-    actNotes.push('phone');
+    actRatio += config.smsFocus ? 0.35 : 0.15;
+    actNotes.push(config.smsFocus ? 'SMS-ready phone' : 'phone');
   }
   if (input.business_email) {
     actRatio += 0.15;
@@ -659,6 +665,80 @@ export function leadsToCsv(leads: Lead[]): string {
   const lines = [columns.join(',')];
   for (const lead of leads) {
     lines.push(columns.map((col) => escapeCell(lead[col])).join(','));
+  }
+  return '\uFEFF' + lines.join('\r\n');
+}
+
+export const DEFAULT_ZOOM_SMS_TEMPLATE =
+  'Need design support? We handle floor plans, site plans, elevations, permit sets, CD sets and 3D renderings. Reply YES for samples. Reply STOP to opt out.';
+
+export function getSmsReadyLeads(leads: Lead[]): Lead[] {
+  const seenPhones = new Set<string>();
+  const out: Lead[] = [];
+  for (const lead of leads) {
+    const digits = lead.phone_digits || normalizePhone(lead.business_phone).digits;
+    if (digits.length !== 10 || seenPhones.has(digits)) continue;
+    seenPhones.add(digits);
+    out.push(lead);
+  }
+  return out;
+}
+
+export function leadsToZoomSmsCsv(
+  leads: Lead[],
+  smsTemplate = DEFAULT_ZOOM_SMS_TEMPLATE,
+): string {
+  const smsLeads = getSmsReadyLeads(leads);
+  const headers = [
+    'First Name',
+    'Last Name',
+    'Phone Number',
+    'Company',
+    'Email',
+    'City',
+    'State',
+    'Zip Code',
+    'Service Match',
+    'Project',
+    'Lead Tier',
+    'Lead Score',
+    'SMS Message',
+  ];
+
+  const escapeCell = (val: unknown) => {
+    const s = String(val ?? '');
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+
+  const lines = [headers.join(',')];
+  for (const lead of smsLeads) {
+    const digits = lead.phone_digits || normalizePhone(lead.business_phone).digits;
+    const e164 = `+1${digits}`;
+    const nameParts = cleanText(lead.contact_person).split(/\s+/).filter(Boolean);
+    const firstName = nameParts[0] || 'Team';
+    const lastName = nameParts.slice(1).join(' ');
+    const message = smsTemplate
+      .replace(/\{company\}/gi, lead.company_name || 'your team')
+      .replace(/\{city\}/gi, lead.city || 'your area')
+      .replace(/\{name\}/gi, firstName);
+
+    const row = [
+      firstName,
+      lastName,
+      e164,
+      lead.company_name,
+      lead.business_email,
+      lead.city,
+      lead.state,
+      lead.zip_code,
+      lead.service_opportunity,
+      lead.project_name,
+      lead.lead_tier,
+      lead.lead_score,
+      message,
+    ];
+    lines.push(row.map(escapeCell).join(','));
   }
   return '\uFEFF' + lines.join('\r\n');
 }

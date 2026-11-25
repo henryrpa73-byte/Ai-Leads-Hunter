@@ -1,18 +1,23 @@
 import {
   BarChart3,
   Building2,
+  Check,
+  Copy,
   Download,
   ExternalLink,
   FileSpreadsheet,
   Flame,
   FolderUp,
+  MessageSquare,
   PhoneCall,
   Search,
   Sparkles,
   Trash2,
+  UploadCloud,
 } from 'lucide-react';
 import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { AutomatedScoringEngine } from './components/AutomatedScoringEngine.tsx';
+import { CrmSyncModal } from './components/CrmSyncModal.tsx';
 import { DailyQuotaTracker } from './components/DailyQuotaTracker.tsx';
 import { DailyReportView } from './components/DailyReportView.tsx';
 import { LeadDetailPanel } from './components/LeadDetailPanel.tsx';
@@ -26,8 +31,11 @@ import {
 import {
   buildNormalizedLead,
   DEFAULT_SCORING_CONFIG,
+  DEFAULT_ZOOM_SMS_TEMPLATE,
+  getSmsReadyLeads,
   leadsToCsv,
   leadsToExcelBuffer,
+  leadsToZoomSmsCsv,
   mergeLeadsDeduplicated,
   parseCsvToLeads,
   parseExcelToLeads,
@@ -42,6 +50,7 @@ type SourceOption = 'all' | 'usaspending' | 'permits';
 
 const STORAGE_KEY = 'ai_leads_hunter_records_v1';
 const SCORING_CONFIG_KEY = 'ai_leads_hunter_scoring_config_v1';
+const SMS_TEMPLATE_KEY = 'ai_leads_hunter_sms_template_v1';
 
 export default function App() {
   const [leads, setLeads] = useState<Lead[]>(() => {
@@ -55,6 +64,8 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState<NavTab>('pipeline');
   const [selectedLeadId, setSelectedLeadId] = useState<string | null>(null);
+  const [selectedLeadIds, setSelectedLeadIds] = useState<Set<string>>(() => new Set());
+  const [crmModalOpen, setCrmModalOpen] = useState(false);
 
   // Filters
   const [searchQuery, setSearchQuery] = useState('');
@@ -69,12 +80,22 @@ export default function App() {
   const [huntSource, setHuntSource] = useState<SourceOption>('all');
   const [huntState, setHuntState] = useState('');
   const [huntLimit, setHuntLimit] = useState<number>(3);
+  const [huntPage, setHuntPage] = useState<number>(1);
+  const [smsPhonePriority, setSmsPhonePriority] = useState<boolean>(false);
   const [autoFindContacts, setAutoFindContacts] = useState<boolean>(true);
   const [hunting, setHunting] = useState(false);
   const [enrichingContacts, setEnrichingContacts] = useState(false);
   const [bannerMessage, setBannerMessage] = useState<{ type: 'info' | 'error'; text: string } | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [dailyQuota, setDailyQuota] = useState<DailyQuotaState>(() => loadDailyQuota());
+  const [smsTemplate, setSmsTemplate] = useState<string>(() => {
+    try {
+      return localStorage.getItem(SMS_TEMPLATE_KEY) || DEFAULT_ZOOM_SMS_TEMPLATE;
+    } catch {
+      return DEFAULT_ZOOM_SMS_TEMPLATE;
+    }
+  });
+  const [copiedSms, setCopiedSms] = useState(false);
   const [scoringConfig, setScoringConfig] = useState<ScoringCriteriaConfig>(() => {
     try {
       const saved = localStorage.getItem(SCORING_CONFIG_KEY);
@@ -97,6 +118,14 @@ export default function App() {
   useEffect(() => {
     saveDailyQuota(dailyQuota);
   }, [dailyQuota]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SMS_TEMPLATE_KEY, smsTemplate);
+    } catch {
+      // Ignore storage quota warnings
+    }
+  }, [smsTemplate]);
 
   useEffect(() => {
     try {
@@ -201,6 +230,26 @@ export default function App() {
       : 0;
     return { total: leads.length, warm, potential, avgScore };
   }, [leads]);
+
+  const smsReadyFiltered = useMemo(() => getSmsReadyLeads(filteredLeads), [filteredLeads]);
+
+  const warmLeadsFiltered = useMemo(
+    () => filteredLeads.filter((l) => l.lead_tier === 'Warm'),
+    [filteredLeads],
+  );
+
+  const selectedLeadsForCrm = useMemo(
+    () => leads.filter((l) => selectedLeadIds.has(l.id)),
+    [leads, selectedLeadIds],
+  );
+
+  const allVisibleSelected = useMemo(
+    () => filteredLeads.length > 0 && filteredLeads.every((l) => selectedLeadIds.has(l.id)),
+    [filteredLeads, selectedLeadIds],
+  );
+
+  const crmSyncCount =
+    selectedLeadsForCrm.length > 0 ? selectedLeadsForCrm.length : warmLeadsFiltered.length;
 
   const enrichLeadsContacts = async (targetLeads: Lead[], prefixMessage = '') => {
     const candidates = targetLeads.filter(
@@ -344,7 +393,10 @@ export default function App() {
 
   const handleHuntLive = async () => {
     setHunting(true);
-    setBannerMessage({ type: 'info', text: 'Step 1/2: Discovering live, awarded & winning US projects...' });
+    setBannerMessage({
+      type: 'info',
+      text: `Step 1/2: Discovering US construction & design projects (page ${huntPage})...`,
+    });
     try {
       const resp = await fetch('/api/discover/live', {
         method: 'POST',
@@ -353,6 +405,8 @@ export default function App() {
           source: huntSource,
           state: huntState.trim().toUpperCase(),
           limit: huntLimit,
+          page: huntPage,
+          smsPhonePriority,
         }),
       });
       const data = (await resp.json()) as DiscoveryResponse & { error?: string };
@@ -365,24 +419,30 @@ export default function App() {
       recordDiscoveryUsage(discovered);
       const { merged, addedCount, duplicateCount } = mergeLeadsDeduplicated(leads, discovered);
       setLeads(merged);
+      setHuntPage((p) => p + 1);
       if (!selectedLeadId && merged.length > 0) {
         setSelectedLeadId(merged[0].id);
       }
 
+      const smsInBatch = getSmsReadyLeads(discovered).length;
       const warnText = data.summary.warnings.length ? ` (${data.summary.warnings.join('; ')})` : '';
-      const step1Summary = `Found ${data.summary.fetched} live/awarded projects (${addedCount} new, ${duplicateCount} merged).`;
+      const step1Summary = `Found ${data.summary.fetched} projects (${addedCount} new, ${duplicateCount} merged, ${smsInBatch} SMS-ready phones).`;
 
       if (autoFindContacts && discovered.length > 0) {
         setHunting(false);
-        const contactRes = await enrichLeadsContacts(discovered, `Step 2/2: ${step1Summary} `);
+        const enrichBatch =
+          discovered.length > 40
+            ? discovered.filter((l) => !l.phone_digits).slice(0, 24)
+            : discovered;
+        const contactRes = await enrichLeadsContacts(enrichBatch, `Step 2/2: ${step1Summary} `);
         setBannerMessage({
           type: 'info',
-          text: `${step1Summary} Auto-contact scan complete: ${contactRes.enriched} leads enriched (${contactRes.phones} phones, ${contactRes.emails} emails). Ready to export CSV or Excel.${warnText}`,
+          text: `${step1Summary} Enriched ${contactRes.enriched} extra leads (${contactRes.phones} phones, ${contactRes.emails} emails). Ready for Zoom SMS CSV or Excel export.${warnText}`,
         });
       } else {
         setBannerMessage({
           type: 'info',
-          text: `${step1Summary}${warnText}`,
+          text: `${step1Summary} Ready for Zoom SMS CSV or Excel export.${warnText}`,
         });
       }
     } catch {
@@ -486,6 +546,29 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const handleExportZoomSms = (rows: Lead[], filename: string) => {
+    const csvContent = leadsToZoomSmsCsv(rows, smsTemplate);
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleCopySmsTemplate = async () => {
+    try {
+      await navigator.clipboard.writeText(smsTemplate);
+      setCopiedSms(true);
+      setTimeout(() => setCopiedSms(false), 1800);
+    } catch {
+      // Clipboard blocked in non-HTTPS iframe fallback
+    }
+  };
+
   const handleExportExcel = async (rows: Lead[], filename: string) => {
     const buffer = await leadsToExcelBuffer(rows);
     const blob = new Blob([buffer], {
@@ -504,8 +587,54 @@ export default function App() {
   const handleClearAll = () => {
     setLeads([]);
     setSelectedLeadId(null);
+    setSelectedLeadIds(new Set());
     setConfirmClear(false);
     setBannerMessage({ type: 'info', text: 'Local lead pipeline cleared.' });
+  };
+
+  const toggleSelectLead = (id: string) => {
+    setSelectedLeadIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const toggleSelectAllVisible = () => {
+    setSelectedLeadIds((prev) => {
+      const next = new Set(prev);
+      if (allVisibleSelected) {
+        filteredLeads.forEach((l) => next.delete(l.id));
+      } else {
+        filteredLeads.forEach((l) => next.add(l.id));
+      }
+      return next;
+    });
+  };
+
+  const handleSelectWarmVisible = () => {
+    setSelectedLeadIds(new Set(warmLeadsFiltered.map((l) => l.id)));
+  };
+
+  const handleCrmSyncComplete = (
+    leadIds: string[],
+    summaryText: string,
+    markQueued: boolean,
+  ) => {
+    if (markQueued && leadIds.length > 0) {
+      const idSet = new Set(leadIds);
+      const today = getTodayDateKey();
+      setLeads((prev) =>
+        prev.map((l) =>
+          idSet.has(l.id) ? { ...l, outreach_status: 'Queued', last_verified: today } : l,
+        ),
+      );
+    }
+    setBannerMessage({ type: 'info', text: summaryText });
   };
 
   return (
@@ -623,7 +752,7 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2.5 shrink-0">
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
             <input
               ref={fileInputRef}
               type="file"
@@ -634,25 +763,43 @@ export default function App() {
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0"
             >
               <FolderUp className="w-3.5 h-3.5" />
               Import CSV / Excel
             </button>
             <button
               type="button"
+              onClick={() => handleExportZoomSms(filteredLeads, `zoom_dialer_sms_${new Date().toISOString().slice(0, 10)}.csv`)}
+              disabled={smsReadyFiltered.length === 0}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-amber-600 rounded-md hover:bg-amber-700 transition-colors disabled:opacity-40 whitespace-nowrap shrink-0"
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              Zoom SMS CSV ({smsReadyFiltered.length})
+            </button>
+            <button
+              type="button"
               onClick={() => handleExportCsv(filteredLeads, `leads_filtered_${new Date().toISOString().slice(0, 10)}.csv`)}
               disabled={filteredLeads.length === 0}
-              className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors disabled:opacity-40 whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors disabled:opacity-40 whitespace-nowrap shrink-0"
             >
               <Download className="w-3.5 h-3.5" />
               Export CSV
             </button>
             <button
               type="button"
+              onClick={() => setCrmModalOpen(true)}
+              disabled={crmSyncCount === 0}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-900 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors disabled:opacity-40 whitespace-nowrap shrink-0"
+            >
+              <UploadCloud className="w-3.5 h-3.5" />
+              Sync to CRM ({crmSyncCount})
+            </button>
+            <button
+              type="button"
               onClick={() => handleExportExcel(filteredLeads, `leads_filtered_${new Date().toISOString().slice(0, 10)}.xlsx`)}
               disabled={filteredLeads.length === 0}
-              className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800 transition-colors disabled:opacity-40 whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800 transition-colors disabled:opacity-40 whitespace-nowrap shrink-0"
             >
               <FileSpreadsheet className="w-3.5 h-3.5" />
               Export Excel (.xlsx)
@@ -703,12 +850,15 @@ export default function App() {
                 <select
                   id="hunt-source"
                   value={huntSource}
-                  onChange={(e) => setHuntSource(e.target.value as SourceOption)}
+                  onChange={(e) => {
+                    setHuntSource(e.target.value as SourceOption);
+                    setHuntPage(1);
+                  }}
                   className="h-9 px-3 text-xs bg-white border border-slate-300 rounded-md text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900"
                 >
-                  <option value="all">All Free US Sources (USASpending + Permits)</option>
+                  <option value="all">All US Sources (Awards + 5 City Portals)</option>
                   <option value="usaspending">USASpending.gov Federal Awards</option>
-                  <option value="permits">City Building Permits (Austin & Chicago)</option>
+                  <option value="permits">City Permits (Austin, NYC, Dallas, Chicago)</option>
                 </select>
               </div>
 
@@ -721,9 +871,12 @@ export default function App() {
                   type="text"
                   maxLength={2}
                   value={huntState}
-                  onChange={(e) => setHuntState(e.target.value.toUpperCase())}
+                  onChange={(e) => {
+                    setHuntState(e.target.value.toUpperCase());
+                    setHuntPage(1);
+                  }}
                   placeholder="All (e.g. TX)"
-                  className="w-28 h-9 px-3 text-xs bg-white border border-slate-300 rounded-md text-slate-900 uppercase focus:outline-none focus:ring-2 focus:ring-slate-900"
+                  className="w-24 h-9 px-3 text-xs bg-white border border-slate-300 rounded-md text-slate-900 uppercase focus:outline-none focus:ring-2 focus:ring-slate-900"
                 />
               </div>
 
@@ -734,14 +887,32 @@ export default function App() {
                 <select
                   id="hunt-limit"
                   value={huntLimit}
-                  onChange={(e) => setHuntLimit(Number(e.target.value))}
+                  onChange={(e) => {
+                    setHuntLimit(Number(e.target.value));
+                    setHuntPage(1);
+                  }}
                   className="h-9 px-3 text-xs bg-white border border-slate-300 rounded-md text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900"
                 >
-                  <option value={2}>Small (2 / category)</option>
-                  <option value={3}>Standard (3 / category)</option>
-                  <option value={5}>Deep (5 / category)</option>
+                  <option value={3}>Standard (~35 leads)</option>
+                  <option value={25}>Medium (~150 leads)</option>
+                  <option value={150}>Bulk SMS (~500 leads)</option>
+                  <option value={350}>SMS Scale (1,000+ leads)</option>
                 </select>
               </div>
+
+              <label className="h-9 px-2.5 inline-flex items-center gap-2 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-md cursor-pointer select-none whitespace-nowrap">
+                <input
+                  type="checkbox"
+                  checked={smsPhonePriority}
+                  onChange={(e) => {
+                    setSmsPhonePriority(e.target.checked);
+                    setHuntPage(1);
+                  }}
+                  className="rounded border-slate-300 text-amber-600 focus:ring-amber-600"
+                />
+                SMS Phone-Ready Only
+              </label>
+
               <label className="h-9 px-2.5 inline-flex items-center gap-2 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-md cursor-pointer select-none whitespace-nowrap">
                 <input
                   type="checkbox"
@@ -832,13 +1003,19 @@ export default function App() {
           )}
 
           {activeTab === 'report' ? (
-            <DailyReportView leads={leads} onExportCsv={handleExportCsv} onExportExcel={handleExportExcel} />
+            <DailyReportView
+              leads={leads}
+              onExportCsv={handleExportCsv}
+              onExportExcel={handleExportExcel}
+              onExportZoomSms={handleExportZoomSms}
+            />
           ) : (
             <>
               <DailyQuotaTracker
                 quota={dailyQuota}
                 huntSource={huntSource}
                 huntLimit={huntLimit}
+                smsPhonePriority={smsPhonePriority}
                 onChangeDailyTier={(limit) =>
                   setDailyQuota((prev) => ({
                     ...prev,
@@ -856,6 +1033,57 @@ export default function App() {
                 config={scoringConfig}
                 onApplyScoring={handleApplyScoring}
               />
+
+              {/* Zoom Dialer Bulk SMS Campaign Strip */}
+              <section
+                aria-label="Zoom Dialer SMS Campaign"
+                className="bg-white border border-slate-200 rounded-lg p-4 space-y-2.5"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 text-xs">
+                    <MessageSquare className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                    <span className="font-semibold text-slate-900">Zoom Dialer SMS Outreach</span>
+                    <span className="text-slate-400" aria-hidden="true">·</span>
+                    <span className="font-mono-tabular text-slate-700">
+                      <strong>{smsReadyFiltered.length}</strong> unique +1 US numbers ready
+                    </span>
+                    <span className="text-slate-400 hidden sm:inline" aria-hidden="true">·</span>
+                    <span className="text-slate-500 hidden sm:inline">
+                      Winter Architecture, 2D/3D, Permit &amp; CD Sets
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleCopySmsTemplate}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 whitespace-nowrap"
+                    >
+                      {copiedSms ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copiedSms ? 'Copied' : 'Copy SMS'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleExportZoomSms(filteredLeads, `zoom_dialer_sms_${new Date().toISOString().slice(0, 10)}.csv`)
+                      }
+                      disabled={smsReadyFiltered.length === 0}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 rounded-md hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      Export Zoom SMS CSV ({smsReadyFiltered.length})
+                    </button>
+                  </div>
+                </div>
+
+                <textarea
+                  aria-label="Zoom Dialer SMS template"
+                  rows={2}
+                  value={smsTemplate}
+                  onChange={(e) => setSmsTemplate(e.target.value)}
+                  className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-900"
+                />
+              </section>
 
               {/* KPI Strip */}
               <section className="bg-white border border-slate-200 rounded-lg grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-slate-200">
@@ -981,6 +1209,25 @@ export default function App() {
                       >
                         Has Phone / Email
                       </button>
+
+                      <button
+                        type="button"
+                        onClick={handleSelectWarmVisible}
+                        disabled={warmLeadsFiltered.length === 0}
+                        className="h-8 px-2.5 text-xs font-medium rounded-md border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40 whitespace-nowrap"
+                      >
+                        Select Warm ({warmLeadsFiltered.length})
+                      </button>
+
+                      {selectedLeadIds.size > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedLeadIds(new Set())}
+                          className="h-8 px-2.5 text-xs font-medium rounded-md border border-slate-200 bg-slate-100 text-slate-700 hover:bg-slate-200 whitespace-nowrap"
+                        >
+                          Clear Selected ({selectedLeadIds.size})
+                        </button>
+                      )}
                     </div>
                   </div>
 
@@ -1022,6 +1269,15 @@ export default function App() {
                       <table className="w-full text-xs text-left">
                         <thead>
                           <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                            <th className="py-2.5 pl-4 pr-2 w-8">
+                              <input
+                                type="checkbox"
+                                aria-label="Select all visible leads"
+                                checked={allVisibleSelected}
+                                onChange={toggleSelectAllVisible}
+                                className="rounded border-slate-300 text-slate-900 focus:ring-slate-900"
+                              />
+                            </th>
                             <th className="py-2.5 px-4 font-medium">Company & Live Project</th>
                             <th className="py-2.5 px-3 font-medium">Project Contact</th>
                             <th className="py-2.5 px-3 font-medium">Location</th>
@@ -1033,6 +1289,7 @@ export default function App() {
                         <tbody className="divide-y divide-slate-100">
                           {filteredLeads.map((lead) => {
                             const isSelected = lead.id === selectedLead?.id;
+                            const isChecked = selectedLeadIds.has(lead.id);
                             const srcUrl = safeExternalUrl(lead.project_source_url || lead.company_source_url);
                             return (
                               <tr
@@ -1042,6 +1299,18 @@ export default function App() {
                                   isSelected ? 'bg-slate-100' : 'hover:bg-slate-50'
                                 }`}
                               >
+                                <td
+                                  className="py-2.5 pl-4 pr-2 w-8"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    aria-label={`Select ${lead.company_name}`}
+                                    checked={isChecked}
+                                    onChange={() => toggleSelectLead(lead.id)}
+                                    className="rounded border-slate-300 text-slate-900 focus:ring-slate-900"
+                                  />
+                                </td>
                                 <td className="py-2.5 px-4 max-w-[300px]">
                                   <div className="font-semibold text-slate-900 truncate">
                                     {lead.company_name}
@@ -1123,6 +1392,14 @@ export default function App() {
           )}
         </main>
       </div>
+
+      <CrmSyncModal
+        isOpen={crmModalOpen}
+        onClose={() => setCrmModalOpen(false)}
+        selectedLeads={selectedLeadsForCrm}
+        warmLeads={warmLeadsFiltered}
+        onSyncComplete={handleCrmSyncComplete}
+      />
     </div>
   );
 }
