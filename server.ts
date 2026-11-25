@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer as createViteServer } from 'vite';
 import { type CrmPlatform, mapLeadsToCrmRecords } from './src/lib/crmSync.ts';
-import { buildNormalizedLead, inferServiceOpportunity } from './src/lib/leadEngine.ts';
+import { buildNormalizedLead, inferServiceOpportunity, normalizeState } from './src/lib/leadEngine.ts';
 import type { Lead } from './src/types/lead.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -142,95 +142,94 @@ async function discoverUsaSpending(stateFilter: string, limitPerNaics: number, p
           10000,
         )) as { results?: Array<Record<string, unknown>> };
 
-        const naicsLeads: Lead[] = [];
-        for (const row of data.results || []) {
-          const genId = String(row['generated_internal_id'] || '');
-          let city = '';
-          let state = String(row['Place of Performance State Code'] || '');
-          let zip = String(row['Place of Performance Zip5'] || '');
-          let recipientName = String(row['Recipient Name'] || '');
-          let categories: string[] = [];
-          let popLocation = state;
-          let contactPerson = '';
-          let jobTitle = '';
-          const rawEndDt = String(row['End Date'] || '').slice(0, 10);
-          const todayIso = new Date().toISOString().slice(0, 10);
-          let liveStatus = rawEndDt
-            ? rawEndDt >= todayIso
-              ? `Live Won Project (ends ${rawEndDt})`
-              : `Completed Award (ended ${rawEndDt})`
-            : String(row['Start Date'] || '')
-              ? 'Awarded'
-              : 'Active';
+        const naicsLeads = await Promise.all(
+          (data.results || []).map(async (row) => {
+            const genId = String(row['generated_internal_id'] || '');
+            let city = '';
+            let state = String(row['Place of Performance State Code'] || '');
+            let zip = String(row['Place of Performance Zip5'] || '');
+            let recipientName = String(row['Recipient Name'] || '');
+            let categories: string[] = [];
+            let popLocation = state;
+            let contactPerson = '';
+            let jobTitle = '';
+            const rawEndDt = String(row['End Date'] || '').slice(0, 10);
+            const todayIso = new Date().toISOString().slice(0, 10);
+            let liveStatus = rawEndDt
+              ? rawEndDt >= todayIso
+                ? `Live Won Project (ends ${rawEndDt})`
+                : `Completed Award (ended ${rawEndDt})`
+              : String(row['Start Date'] || '')
+                ? 'Awarded'
+                : 'Active';
 
-          if (fetchDetails && genId) {
-            try {
-              const detail = (await fetchJsonWithTimeout(
-                `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(genId)}/`,
-                {},
-                7000,
-              )) as {
-                recipient?: {
-                  recipient_name?: string;
-                  business_categories?: string[];
-                  location?: { city_name?: string; state_code?: string; zip5?: string };
+            if (fetchDetails && genId) {
+              try {
+                const detail = (await fetchJsonWithTimeout(
+                  `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(genId)}/`,
+                  {},
+                  4500,
+                )) as {
+                  recipient?: {
+                    recipient_name?: string;
+                    business_categories?: string[];
+                    location?: { city_name?: string; state_code?: string; zip5?: string };
+                  };
+                  executive_details?: {
+                    officers?: Array<{ name?: string | null }>;
+                  };
+                  period_of_performance?: {
+                    start_date?: string | null;
+                    end_date?: string | null;
+                    potential_end_date?: string | null;
+                  };
+                  place_of_performance?: { city_name?: string; state_code?: string };
                 };
-                executive_details?: {
-                  officers?: Array<{ name?: string | null }>;
-                };
-                period_of_performance?: {
-                  start_date?: string | null;
-                  end_date?: string | null;
-                  potential_end_date?: string | null;
-                };
-                place_of_performance?: { city_name?: string; state_code?: string };
-              };
-              const rec = detail.recipient;
-              if (rec?.recipient_name) recipientName = rec.recipient_name;
-              if (rec?.location?.city_name) city = rec.location.city_name;
-              if (rec?.location?.state_code) state = rec.location.state_code;
-              if (rec?.location?.zip5) zip = rec.location.zip5;
-              if (Array.isArray(rec?.business_categories)) categories = rec.business_categories;
-              const popCity = detail.place_of_performance?.city_name || '';
-              const popState = detail.place_of_performance?.state_code || state;
-              popLocation = [popCity, popState].filter(Boolean).join(', ');
+                const rec = detail.recipient;
+                if (rec?.recipient_name) recipientName = rec.recipient_name;
+                if (rec?.location?.city_name) city = rec.location.city_name;
+                if (rec?.location?.state_code) state = rec.location.state_code;
+                if (rec?.location?.zip5) zip = rec.location.zip5;
+                if (Array.isArray(rec?.business_categories)) categories = rec.business_categories;
+                const popCity = detail.place_of_performance?.city_name || '';
+                const popState = detail.place_of_performance?.state_code || state;
+                popLocation = [popCity, popState].filter(Boolean).join(', ');
 
-              const officerName = (detail.executive_details?.officers || []).find((o) => o?.name)?.name || '';
-              if (officerName) {
-                contactPerson = officerName.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
-                jobTitle = 'Executive Officer';
+                const officerName = (detail.executive_details?.officers || []).find((o) => o?.name)?.name || '';
+                if (officerName) {
+                  contactPerson = officerName.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+                  jobTitle = 'Executive Officer';
+                }
+
+                const endDt = String(
+                  detail.period_of_performance?.end_date || detail.period_of_performance?.potential_end_date || '',
+                ).slice(0, 10);
+                if (endDt) {
+                  liveStatus = endDt >= todayIso ? `Live Won Project (ends ${endDt})` : `Completed Award (ended ${endDt})`;
+                }
+              } catch {
+                // Proceed cleanly with search-level fields if individual award detail times out
               }
-
-              const endDt = String(
-                detail.period_of_performance?.end_date || detail.period_of_performance?.potential_end_date || '',
-              ).slice(0, 10);
-              if (endDt) {
-                liveStatus = endDt >= todayIso ? `Live Won Project (ends ${endDt})` : `Completed Award (ended ${endDt})`;
-              }
-            } catch {
-              // Proceed cleanly with search-level fields if individual award detail times out
             }
-          }
 
-          const awardId = String(row['Award ID'] || '');
-          const amount =
-            typeof row['Award Amount'] === 'number'
-              ? `$${Math.round(row['Award Amount']).toLocaleString('en-US')}`
-              : '';
-          const desc = String(row['Description'] || '');
-          const agency = String(row['Awarding Agency'] || '');
-          const startDt = String(row['Start Date'] || '').slice(0, 10);
-          const sourceUrl = genId
-            ? `https://www.usaspending.gov/award/${genId}`
-            : 'https://www.usaspending.gov/search';
+            const awardId = String(row['Award ID'] || '');
+            const amount =
+              typeof row['Award Amount'] === 'number'
+                ? `$${Math.round(row['Award Amount']).toLocaleString('en-US')}`
+                : '';
+            const desc = String(row['Description'] || '');
+            const agency = String(row['Awarding Agency'] || '');
+            const startDt = String(row['Start Date'] || '').slice(0, 10);
+            const sourceUrl = genId
+              ? `https://www.usaspending.gov/award/${genId}`
+              : 'https://www.usaspending.gov/search';
 
-          naicsLeads.push(
-            buildNormalizedLead({
+            return buildNormalizedLead({
               company_name: recipientName,
               contact_person: contactPerson,
               job_title: jobTitle,
               city: city ? city.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()) : '',
-              state,
+              state: stateFilter || state,
               zip_code: zip,
               company_category: categoryLabel,
               services_offered: categories.slice(0, 4).join(', '),
@@ -251,9 +250,9 @@ async function discoverUsaSpending(stateFilter: string, limitPerNaics: number, p
                 .filter(Boolean)
                 .join('; '),
               source_name: 'USASpending.gov',
-            }),
-          );
-        }
+            });
+          }),
+        );
         return naicsLeads;
       } catch {
         return [] as Lead[];
@@ -578,6 +577,219 @@ async function discoverMunicipalPermits(
             );
           }
           if (out.length > 0) portalsUsed.push('Chicago IL');
+          return out;
+        } catch {
+          return [];
+        }
+      })(),
+    );
+  }
+
+  // 6. Orlando, FL Building Permits (includes contractor_phone_number + contractor_name)
+  if (!stateFilter || stateFilter === 'FL') {
+    tasks.push(
+      (async () => {
+        try {
+          const whereClause = smsPhonePriority
+            ? 'contractor_name IS NOT NULL AND contractor_phone_number IS NOT NULL'
+            : 'contractor_name IS NOT NULL';
+          const orlandoUrl = `https://data.cityoforlando.net/resource/ryhf-m453.json?$where=${encodeURIComponent(
+            whereClause,
+          )}&$order=${encodeURIComponent('processed_date DESC')}&$limit=${Math.min(250, cap)}&$offset=${offset}`;
+          const rows = (await fetchJsonWithTimeout(orlandoUrl, {}, 12000)) as Array<Record<string, unknown>>;
+          const out: Lead[] = [];
+          for (const row of rows) {
+            const company = String(row.contractor_name || row.contractor || '').trim();
+            if (!company || company === 'N/A') continue;
+            const permitNum = String(row.permit_number || '').trim();
+            const appType = String(row.application_type || '').trim();
+            const workType = String(row.worktype || '').trim();
+            const addr = String(row.permit_address || '').trim();
+            const processed = String(row.processed_date || '').slice(0, 10);
+            const costNum = Number.parseFloat(String(row.estimated_cost || '0'));
+            const valText =
+              Number.isFinite(costNum) && costNum > 0
+                ? ` · Value: $${Math.round(costNum).toLocaleString('en-US')}`
+                : '';
+
+            out.push(
+              buildNormalizedLead({
+                company_name: company,
+                business_phone: String(row.contractor_phone_number || ''),
+                contact_person: String(row.contractor || '').trim(),
+                job_title: 'Licensed Contractor',
+                city: 'Orlando',
+                state: 'FL',
+                company_category: appType || 'Orlando Building Contractor',
+                service_opportunity: inferServiceOpportunity(`${appType} ${workType} ${row.plan_review_type || ''}`),
+                project_name: permitNum ? `Orlando Permit ${permitNum}` : 'Orlando Building Permit',
+                project_description: [appType, workType, String(row.plan_review_type || '').trim()]
+                  .filter(Boolean)
+                  .join(': ')
+                  .slice(0, 450),
+                project_location: [addr, 'Orlando, FL'].filter(Boolean).join(', '),
+                project_status: `Live ${String(row.application_status || 'Open')} Permit`,
+                project_source_url: permitNum
+                  ? `https://data.cityoforlando.net/resource/ryhf-m453.json?permit_number=${encodeURIComponent(permitNum)}`
+                  : 'https://data.cityoforlando.net/d/ryhf-m453',
+                company_source_url: 'https://data.cityoforlando.net/d/ryhf-m453',
+                buying_intent_evidence: `Orlando permit ${permitNum} (${processed})${valText}`.trim(),
+                source_name: 'Orlando Building Permits',
+              }),
+            );
+          }
+          if (out.length > 0) portalsUsed.push('Orlando FL');
+          return out;
+        } catch {
+          return [];
+        }
+      })(),
+    );
+  }
+
+  // 7. Seattle, WA Building Permits
+  if ((!stateFilter || stateFilter === 'WA') && !smsPhonePriority) {
+    tasks.push(
+      (async () => {
+        try {
+          const seattleUrl = `https://data.seattle.gov/resource/76t5-zqzr.json?$where=${encodeURIComponent(
+            'contractorcompanyname IS NOT NULL',
+          )}&$order=${encodeURIComponent('issueddate DESC')}&$limit=${Math.min(200, cap)}&$offset=${offset}`;
+          const rows = (await fetchJsonWithTimeout(seattleUrl, {}, 12000)) as Array<Record<string, unknown>>;
+          const out: Lead[] = [];
+          for (const row of rows) {
+            const company = String(row.contractorcompanyname || '').trim();
+            if (!company) continue;
+            const permitNum = String(row.permitnum || '').trim();
+            const desc = String(row.description || '').trim();
+            const costNum = Number.parseFloat(String(row.estprojectcost || '0'));
+            const valText =
+              Number.isFinite(costNum) && costNum > 0
+                ? ` · Value: $${Math.round(costNum).toLocaleString('en-US')}`
+                : '';
+            const linkObj = row.link as { url?: string } | undefined;
+            const portalUrl = linkObj?.url || 'https://data.seattle.gov/d/76t5-zqzr';
+
+            out.push(
+              buildNormalizedLead({
+                company_name: company,
+                city: String(row.originalcity || 'Seattle'),
+                state: String(row.originalstate || 'WA'),
+                zip_code: String(row.originalzip || ''),
+                company_category: String(row.permitclass || 'Seattle Building Contractor'),
+                service_opportunity: inferServiceOpportunity(`${row.permittypedesc || ''} ${desc}`),
+                project_name: permitNum ? `Seattle Permit ${permitNum}` : 'Seattle Building Permit',
+                project_description: [row.permittypedesc, desc].filter(Boolean).join(': ').slice(0, 450),
+                project_location: [row.originaladdress1, 'Seattle, WA'].filter(Boolean).join(', '),
+                project_status: `Live ${String(row.statuscurrent || 'Active')} Permit`,
+                project_source_url: portalUrl,
+                company_source_url: 'https://data.seattle.gov/d/76t5-zqzr',
+                buying_intent_evidence: `Seattle permit ${permitNum}${valText}`.trim(),
+                source_name: 'Seattle Building Permits',
+              }),
+            );
+          }
+          if (out.length > 0) portalsUsed.push('Seattle WA');
+          return out;
+        } catch {
+          return [];
+        }
+      })(),
+    );
+  }
+
+  // 8. Cincinnati, OH Building Permits
+  if ((!stateFilter || stateFilter === 'OH') && !smsPhonePriority) {
+    tasks.push(
+      (async () => {
+        try {
+          const cincUrl = `https://data.cincinnati-oh.gov/resource/uhjb-xac9.json?$where=${encodeURIComponent(
+            'companyname IS NOT NULL',
+          )}&$order=${encodeURIComponent('issueddate DESC')}&$limit=${Math.min(200, cap)}&$offset=${offset}`;
+          const rows = (await fetchJsonWithTimeout(cincUrl, {}, 12000)) as Array<Record<string, unknown>>;
+          const out: Lead[] = [];
+          for (const row of rows) {
+            const company = String(row.companyname || '').replace(/^"+|"+$/g, '').trim();
+            if (!company) continue;
+            const permitNum = String(row.permitnum || '').trim();
+            const desc = String(row.description || '').trim();
+            const costNum = Number.parseFloat(String(row.estprojectcostdec || '0'));
+            const valText =
+              Number.isFinite(costNum) && costNum > 0
+                ? ` · Value: $${Math.round(costNum).toLocaleString('en-US')}`
+                : '';
+
+            out.push(
+              buildNormalizedLead({
+                company_name: company,
+                city: String(row.originalcity || 'Cincinnati'),
+                state: String(row.originalstate || 'OH'),
+                zip_code: String(row.originalzip || ''),
+                company_category: String(row.permittypemapped || 'Building Contractor'),
+                service_opportunity: inferServiceOpportunity(`${row.permittypemapped || ''} ${desc}`),
+                project_name: permitNum ? `Cincinnati Permit ${permitNum}` : 'Cincinnati Building Permit',
+                project_description: desc.slice(0, 450),
+                project_location: [row.originaladdress1, 'Cincinnati, OH'].filter(Boolean).join(', '),
+                project_status: `Live ${String(row.statuscurrentmapped || 'Active')} Permit`,
+                project_source_url: String(row.link || 'https://data.cincinnati-oh.gov/d/uhjb-xac9'),
+                company_source_url: 'https://data.cincinnati-oh.gov/d/uhjb-xac9',
+                buying_intent_evidence: `Cincinnati permit ${permitNum}${valText}`.trim(),
+                source_name: 'Cincinnati Building Permits',
+              }),
+            );
+          }
+          if (out.length > 0) portalsUsed.push('Cincinnati OH');
+          return out;
+        } catch {
+          return [];
+        }
+      })(),
+    );
+  }
+
+  // 9. New Orleans, LA Building Permits
+  if ((!stateFilter || stateFilter === 'LA') && !smsPhonePriority) {
+    tasks.push(
+      (async () => {
+        try {
+          const nolaUrl = `https://data.nola.gov/resource/rcm3-fn58.json?$where=${encodeURIComponent(
+            'contractors IS NOT NULL',
+          )}&$order=${encodeURIComponent('issuedate DESC')}&$limit=${Math.min(200, cap)}&$offset=${offset}`;
+          const rows = (await fetchJsonWithTimeout(nolaUrl, {}, 12000)) as Array<Record<string, unknown>>;
+          const out: Lead[] = [];
+          for (const row of rows) {
+            const company = String(row.contractors || '').trim();
+            if (!company || company.toUpperCase() === 'OWNER') continue;
+            const permitNum = String(row.numstring || '').trim();
+            const desc = String(row.description || '').trim();
+            const costNum = Number.parseFloat(String(row.constrval || '0'));
+            const valText =
+              Number.isFinite(costNum) && costNum > 0
+                ? ` · Value: $${Math.round(costNum).toLocaleString('en-US')}`
+                : '';
+
+            out.push(
+              buildNormalizedLead({
+                company_name: company,
+                contact_person: String(row.applicant || '').trim(),
+                city: 'New Orleans',
+                state: 'LA',
+                company_category: String(row.landuse || row.type || 'Building Contractor'),
+                service_opportunity: inferServiceOpportunity(`${row.type || ''} ${desc}`),
+                project_name: permitNum ? `NOLA Permit ${permitNum}` : 'New Orleans Building Permit',
+                project_description: [row.type, desc].filter(Boolean).join(': ').slice(0, 450),
+                project_location: [row.address, 'New Orleans, LA'].filter(Boolean).join(', '),
+                project_status: `Live ${String(row.currentstatus || 'Issued')} Permit`,
+                project_source_url: permitNum
+                  ? `https://data.nola.gov/resource/rcm3-fn58.json?numstring=${encodeURIComponent(permitNum)}`
+                  : 'https://data.nola.gov/d/rcm3-fn58',
+                company_source_url: 'https://data.nola.gov/d/rcm3-fn58',
+                buying_intent_evidence: `New Orleans permit ${permitNum}${valText}`.trim(),
+                source_name: 'New Orleans Permits',
+              }),
+            );
+          }
+          if (out.length > 0) portalsUsed.push('New Orleans LA');
           return out;
         } catch {
           return [];
@@ -1106,67 +1318,102 @@ async function startServer() {
   app.post('/api/discover/live', async (req, res) => {
     try {
       const source = String(req.body?.source || 'all');
-      const state = String(req.body?.state || '').trim().toUpperCase().slice(0, 2);
+      const rawState = String(req.body?.state || '').trim();
+      const state = normalizeState(rawState) || rawState.toUpperCase().slice(0, 2);
       const limit = Number.isFinite(Number(req.body?.limit))
         ? Math.max(1, Math.min(350, Number(req.body.limit)))
         : 3;
-      const page = Number.isFinite(Number(req.body?.page))
+      const requestedPage = Number.isFinite(Number(req.body?.page))
         ? Math.max(1, Math.min(50, Number(req.body.page)))
         : 1;
       const smsPhonePriority = Boolean(req.body?.smsPhonePriority);
 
-      const allLeads: Lead[] = [];
-      const sourcesRun: string[] = [];
-      const warnings: string[] = [];
+      const hasDirectPhonePermitPortal = !state || state === 'TX' || state === 'NY' || state === 'FL';
+      const hasAnyPermitPortal = !state || ['TX', 'NY', 'IL', 'FL', 'WA', 'OH', 'LA'].includes(state);
 
-      const tasks: Array<Promise<void>> = [];
+      const runDiscoveryPass = async (pageNum: number) => {
+        const allLeads: Lead[] = [];
+        const sourcesRun: string[] = [];
+        const warnings: string[] = [];
+        const tasks: Array<Promise<void>> = [];
 
-      if ((source === 'all' || source === 'usaspending') && !smsPhonePriority) {
-        tasks.push(
-          (async () => {
-            try {
-              const usaCap = limit >= 50 ? Math.min(60, Math.ceil(limit / 4)) : Math.min(5, limit);
-              const usaLeads = await discoverUsaSpending(state, usaCap, page);
-              allLeads.push(...usaLeads);
-              sourcesRun.push('USASpending.gov');
-            } catch (err) {
-              warnings.push(`USASpending.gov unavailable: ${err instanceof Error ? err.message : 'Network error'}`);
-            }
-          })(),
-        );
-      }
+        // Ensure ALL 50 states + DC always return leads:
+        // Run USASpending when selected, when SMS Phone-Ready isn't filtering TX/NY/FL direct-phone portals,
+        // OR whenever a state outside the 7 permit-portal states is requested (even in 'permits' mode).
+        const shouldRunUsaSpending =
+          source === 'usaspending' ||
+          (source === 'all' && (!smsPhonePriority || !hasDirectPhonePermitPortal)) ||
+          (source === 'permits' && Boolean(state) && !hasAnyPermitPortal);
 
-      if (source === 'all' || source === 'permits' || smsPhonePriority) {
-        tasks.push(
-          (async () => {
-            try {
-              const portalCap = limit >= 50 ? limit : limit * 4;
-              const { leads: permitLeads, portalsUsed } = await discoverMunicipalPermits(
-                portalCap,
-                page,
-                state,
-                smsPhonePriority,
-              );
-              const filtered = state ? permitLeads.filter((l) => !l.state || l.state === state) : permitLeads;
-              allLeads.push(...filtered);
-              if (portalsUsed.length > 0) {
-                sourcesRun.push(`Permits (${portalsUsed.join(', ')})`);
+        if (shouldRunUsaSpending) {
+          if ((source === 'all' || source === 'permits') && state && !hasAnyPermitPortal) {
+            warnings.push(
+              `Pulled ${state} active construction & design projects from USASpending.gov (covers all 50 states + DC).`,
+            );
+          } else if (source === 'all' && smsPhonePriority && state && !hasDirectPhonePermitPortal) {
+            warnings.push(
+              `Pulled ${state} active federal projects from USASpending.gov for contact phone lookup.`,
+            );
+          }
+          tasks.push(
+            (async () => {
+              try {
+                const usaCap = limit >= 50 ? Math.min(60, Math.ceil(limit / 4)) : Math.min(5, limit);
+                const usaLeads = await discoverUsaSpending(state, usaCap, pageNum);
+                allLeads.push(...usaLeads);
+                sourcesRun.push('USASpending.gov');
+              } catch (err) {
+                warnings.push(`USASpending.gov unavailable: ${err instanceof Error ? err.message : 'Network error'}`);
               }
-            } catch (err) {
-              warnings.push(`Municipal Permits unavailable: ${err instanceof Error ? err.message : 'Network error'}`);
-            }
-          })(),
-        );
-      }
+            })(),
+          );
+        }
 
-      await Promise.all(tasks);
+        const shouldRunPermits =
+          (source === 'all' || source === 'permits') && hasAnyPermitPortal;
+
+        if (shouldRunPermits) {
+          tasks.push(
+            (async () => {
+              try {
+                const portalCap = limit >= 50 ? limit : limit * 4;
+                const { leads: permitLeads, portalsUsed } = await discoverMunicipalPermits(
+                  portalCap,
+                  pageNum,
+                  state,
+                  smsPhonePriority && hasDirectPhonePermitPortal,
+                );
+                const filtered = state ? permitLeads.filter((l) => !l.state || l.state === state) : permitLeads;
+                allLeads.push(...filtered);
+                if (portalsUsed.length > 0) {
+                  sourcesRun.push(`Permits (${portalsUsed.join(', ')})`);
+                }
+              } catch (err) {
+                warnings.push(`Municipal Permits unavailable: ${err instanceof Error ? err.message : 'Network error'}`);
+              }
+            })(),
+          );
+        }
+
+        await Promise.all(tasks);
+        return { allLeads, sourcesRun, warnings };
+      };
+
+      let result = await runDiscoveryPass(requestedPage);
+      if (result.allLeads.length === 0 && requestedPage > 1) {
+        const retry = await runDiscoveryPass(1);
+        if (retry.allLeads.length > 0) {
+          result = retry;
+          result.warnings.push(`Page ${requestedPage} had no more records; reset to page 1.`);
+        }
+      }
 
       res.json({
-        leads: allLeads,
+        leads: result.allLeads,
         summary: {
-          fetched: allLeads.length,
-          sourcesRun,
-          warnings,
+          fetched: result.allLeads.length,
+          sourcesRun: result.sourcesRun,
+          warnings: result.warnings,
         },
       });
     } catch (err) {

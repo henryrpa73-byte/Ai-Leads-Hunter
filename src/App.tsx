@@ -52,6 +52,60 @@ const STORAGE_KEY = 'ai_leads_hunter_records_v1';
 const SCORING_CONFIG_KEY = 'ai_leads_hunter_scoring_config_v1';
 const SMS_TEMPLATE_KEY = 'ai_leads_hunter_sms_template_v1';
 
+const US_STATE_OPTIONS: Array<[string, string]> = [
+  ['AL', 'Alabama'],
+  ['AK', 'Alaska'],
+  ['AZ', 'Arizona'],
+  ['AR', 'Arkansas'],
+  ['CA', 'California'],
+  ['CO', 'Colorado'],
+  ['CT', 'Connecticut'],
+  ['DE', 'Delaware'],
+  ['DC', 'District of Columbia'],
+  ['FL', 'Florida'],
+  ['GA', 'Georgia'],
+  ['HI', 'Hawaii'],
+  ['ID', 'Idaho'],
+  ['IL', 'Illinois'],
+  ['IN', 'Indiana'],
+  ['IA', 'Iowa'],
+  ['KS', 'Kansas'],
+  ['KY', 'Kentucky'],
+  ['LA', 'Louisiana'],
+  ['ME', 'Maine'],
+  ['MD', 'Maryland'],
+  ['MA', 'Massachusetts'],
+  ['MI', 'Michigan'],
+  ['MN', 'Minnesota'],
+  ['MS', 'Mississippi'],
+  ['MO', 'Missouri'],
+  ['MT', 'Montana'],
+  ['NE', 'Nebraska'],
+  ['NV', 'Nevada'],
+  ['NH', 'New Hampshire'],
+  ['NJ', 'New Jersey'],
+  ['NM', 'New Mexico'],
+  ['NY', 'New York'],
+  ['NC', 'North Carolina'],
+  ['ND', 'North Dakota'],
+  ['OH', 'Ohio'],
+  ['OK', 'Oklahoma'],
+  ['OR', 'Oregon'],
+  ['PA', 'Pennsylvania'],
+  ['RI', 'Rhode Island'],
+  ['SC', 'South Carolina'],
+  ['SD', 'South Dakota'],
+  ['TN', 'Tennessee'],
+  ['TX', 'Texas'],
+  ['UT', 'Utah'],
+  ['VT', 'Vermont'],
+  ['VA', 'Virginia'],
+  ['WA', 'Washington'],
+  ['WV', 'West Virginia'],
+  ['WI', 'Wisconsin'],
+  ['WY', 'Wyoming'],
+];
+
 export default function App() {
   const [leads, setLeads] = useState<Lead[]>(() => {
     try {
@@ -416,6 +470,18 @@ export default function App() {
       }
 
       const discovered = rescoreAllLeads(data.leads || [], scoringConfig);
+      if (discovered.length === 0) {
+        const warnDetails = data.summary.warnings.length
+          ? data.summary.warnings.join(' ')
+          : 'No matching projects were returned for those filters. Try clearing the US State filter or switching Public Data Source to "All US Sources".';
+        setHuntPage(1);
+        setBannerMessage({
+          type: 'error',
+          text: warnDetails,
+        });
+        return;
+      }
+
       recordDiscoveryUsage(discovered);
       const { merged, addedCount, duplicateCount } = mergeLeadsDeduplicated(leads, discovered);
       setLeads(merged);
@@ -727,7 +793,7 @@ export default function App() {
 
         <div className="px-2 pt-4 border-t border-slate-200 text-[11px] text-slate-500 space-y-1">
           <div className="font-medium text-slate-700">Free Public Sources Active</div>
-          <div>USASpending.gov · Austin & Chicago Permits · CSV Imports</div>
+          <div>All 50 US States · USASpending.gov · 9 City Permit Portals · CSV/Excel</div>
         </div>
       </aside>
 
@@ -856,28 +922,32 @@ export default function App() {
                   }}
                   className="h-9 px-3 text-xs bg-white border border-slate-300 rounded-md text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900"
                 >
-                  <option value="all">All US Sources (Awards + 5 City Portals)</option>
-                  <option value="usaspending">USASpending.gov Federal Awards</option>
-                  <option value="permits">City Permits (Austin, NYC, Dallas, Chicago)</option>
+                  <option value="all">All 50 States (Awards + 9 City Portals)</option>
+                  <option value="usaspending">USASpending.gov (All 50 States)</option>
+                  <option value="permits">City Permits + State Awards (All 50 States)</option>
                 </select>
               </div>
 
               <div>
                 <label htmlFor="hunt-state" className="block text-xs font-medium text-slate-600 mb-1">
-                  US State (Optional)
+                  US State (50 States + DC)
                 </label>
-                <input
+                <select
                   id="hunt-state"
-                  type="text"
-                  maxLength={2}
                   value={huntState}
                   onChange={(e) => {
-                    setHuntState(e.target.value.toUpperCase());
+                    setHuntState(e.target.value);
                     setHuntPage(1);
                   }}
-                  placeholder="All (e.g. TX)"
-                  className="w-24 h-9 px-3 text-xs bg-white border border-slate-300 rounded-md text-slate-900 uppercase focus:outline-none focus:ring-2 focus:ring-slate-900"
-                />
+                  className="h-9 px-3 text-xs bg-white border border-slate-300 rounded-md text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900"
+                >
+                  <option value="">All 50 States (USA)</option>
+                  {US_STATE_OPTIONS.map(([code, name]) => (
+                    <option key={code} value={code}>
+                      {code} — {name}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               <div>
@@ -1261,8 +1331,26 @@ export default function App() {
                       </div>
                     </div>
                   ) : filteredLeads.length === 0 ? (
-                    <div className="p-10 text-center text-xs text-slate-500">
-                      No leads match your current search or filter settings.
+                    <div className="p-10 text-center space-y-3 text-xs text-slate-500">
+                      <div>
+                        {leads.length} lead(s) are in your pipeline, but none match your current tab or filter settings.
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveTab('pipeline');
+                          setSearchQuery('');
+                          setTierFilter('ALL');
+                          setServiceFilter('ALL');
+                          setStateFilter('ALL');
+                          setMinScore(0);
+                          setLiveProjectsOnly(false);
+                          setHasContactOnly(false);
+                        }}
+                        className="inline-flex items-center px-3 py-1.5 text-xs font-medium text-slate-800 bg-white border border-slate-300 rounded-md hover:bg-slate-50"
+                      >
+                        Reset Filters (Show All {leads.length} Leads)
+                      </button>
                     </div>
                   ) : (
                     <div className="overflow-x-auto">
