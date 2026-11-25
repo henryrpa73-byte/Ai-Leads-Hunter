@@ -203,13 +203,17 @@ export default function App() {
   }, [leads]);
 
   const enrichLeadsContacts = async (targetLeads: Lead[], prefixMessage = '') => {
-    const candidates = targetLeads.filter((l) => !l.business_email || !l.business_phone || !l.website);
-    if (candidates.length === 0) return { enriched: 0, phones: 0, emails: 0 };
+    const candidates = targetLeads.filter(
+      (l) => !l.business_email || !l.business_phone || !l.website || !l.project_name || !l.city,
+    );
+    if (candidates.length === 0) return { enriched: 0, phones: 0, emails: 0, websites: 0, projects: 0 };
 
     setEnrichingContacts(true);
     let totalEnriched = 0;
     let totalPhones = 0;
     let totalEmails = 0;
+    let totalWebsites = 0;
+    let totalProjects = 0;
     const chunkSize = 8;
 
     try {
@@ -217,7 +221,7 @@ export default function App() {
         const chunk = candidates.slice(i, i + chunkSize);
         setBannerMessage({
           type: 'info',
-          text: `${prefixMessage}Finding websites, phone numbers & emails (${Math.min(i + chunk.length, candidates.length)}/${candidates.length} leads)...`,
+          text: `${prefixMessage}Finding websites, emails & live projects (${Math.min(i + chunk.length, candidates.length)}/${candidates.length} leads)...`,
         });
 
         const resp = await fetch('/api/research/batch-contacts', {
@@ -230,6 +234,7 @@ export default function App() {
               website: l.website,
               city: l.city,
               state: l.state,
+              needs_project: !l.project_name,
             })),
           }),
         });
@@ -244,43 +249,75 @@ export default function App() {
             contact_person: string;
             job_title: string;
             services: string;
+            city?: string;
+            state?: string;
+            zip_code?: string;
+            company_category?: string;
+            project_name?: string;
+            project_description?: string;
+            project_location?: string;
+            project_status?: string;
+            project_source_url?: string;
+            buying_intent_evidence?: string;
           }>;
         };
 
         const byId = new Map((payload.results || []).map((r) => [r.id, r]));
         setLeads((prev) =>
-          prev.map((lead) => {
-            const patch = byId.get(lead.id);
-            if (!patch) return lead;
-            const hasNew =
-              (!lead.website && patch.website) ||
-              (!lead.business_email && patch.email) ||
-              (!lead.business_phone && patch.phone) ||
-              (!lead.contact_person && patch.contact_person);
-            if (!hasNew) return lead;
+          prev
+            .map((lead) => {
+              const patch = byId.get(lead.id);
+              if (!patch) return lead;
+              const hasNew =
+                (!lead.website && patch.website) ||
+                (!lead.business_email && patch.email) ||
+                (!lead.business_phone && patch.phone) ||
+                (!lead.contact_person && patch.contact_person) ||
+                (!lead.city && patch.city) ||
+                (!lead.project_name && patch.project_name) ||
+                (!lead.services_offered && patch.services);
+              if (!hasNew) return lead;
 
-            return buildNormalizedLead(
-              {
-                ...lead,
-                website: lead.website || patch.website,
-                business_email: lead.business_email || patch.email,
-                business_phone: lead.business_phone || patch.phone,
-                contact_person: lead.contact_person || patch.contact_person,
-                job_title: lead.job_title || patch.job_title,
-                services_offered: lead.services_offered || patch.services,
-                lead_score: 0, // Re-score with newly discovered contact channels
-                lead_tier: undefined,
-                last_verified: new Date().toISOString().slice(0, 19) + 'Z',
-              },
-              scoringConfig,
-            );
-          }),
+              return buildNormalizedLead(
+                {
+                  ...lead,
+                  website: lead.website || patch.website,
+                  business_email: lead.business_email || patch.email,
+                  business_phone: lead.business_phone || patch.phone,
+                  contact_person: lead.contact_person || patch.contact_person,
+                  job_title: lead.job_title || patch.job_title,
+                  city: lead.city || patch.city || '',
+                  state: (!lead.city && patch.state) ? patch.state : lead.state || patch.state || '',
+                  zip_code: lead.zip_code || patch.zip_code || '',
+                  company_category: lead.company_category || patch.company_category || '',
+                  services_offered: lead.services_offered || patch.services,
+                  project_name: lead.project_name || patch.project_name || '',
+                  project_description: lead.project_description || patch.project_description || '',
+                  project_location: lead.project_location || patch.project_location || '',
+                  project_status: lead.project_status || patch.project_status || '',
+                  project_source_url: lead.project_source_url || patch.project_source_url || '',
+                  company_source_url: lead.company_source_url || patch.project_source_url || '',
+                  buying_intent_evidence: lead.buying_intent_evidence || patch.buying_intent_evidence || '',
+                  lead_score: 0,
+                  lead_tier: undefined,
+                  qualification_reason: '',
+                  confidence_level: undefined,
+                  last_verified: new Date().toISOString().slice(0, 19) + 'Z',
+                },
+                scoringConfig,
+              );
+            })
+            .sort((a, b) => b.lead_score - a.lead_score),
         );
 
         let chunkPhones = 0;
         let chunkEmails = 0;
         for (const r of payload.results || []) {
-          if (r.website || r.email || r.phone || r.contact_person) totalEnriched += 1;
+          if (r.website || r.email || r.phone || r.contact_person || r.project_name || r.city) {
+            totalEnriched += 1;
+          }
+          if (r.website) totalWebsites += 1;
+          if (r.project_name) totalProjects += 1;
           if (r.phone) {
             totalPhones += 1;
             chunkPhones += 1;
@@ -296,7 +333,13 @@ export default function App() {
       setEnrichingContacts(false);
     }
 
-    return { enriched: totalEnriched, phones: totalPhones, emails: totalEmails };
+    return {
+      enriched: totalEnriched,
+      phones: totalPhones,
+      emails: totalEmails,
+      websites: totalWebsites,
+      projects: totalProjects,
+    };
   };
 
   const handleHuntLive = async () => {
@@ -353,15 +396,17 @@ export default function App() {
   };
 
   const handleEnrichMissingContacts = async () => {
-    const missing = filteredLeads.filter((l) => !l.business_email || !l.business_phone || !l.website);
+    const missing = filteredLeads.filter(
+      (l) => !l.business_email || !l.business_phone || !l.website || !l.project_name || !l.city,
+    );
     if (missing.length === 0) {
-      setBannerMessage({ type: 'info', text: 'All visible leads already have website, phone, and email details.' });
+      setBannerMessage({ type: 'info', text: 'All visible leads already have website, contact, and project details.' });
       return;
     }
-    const res = await enrichLeadsContacts(missing.slice(0, 24), 'Contact enrichment: ');
+    const res = await enrichLeadsContacts(missing.slice(0, 100), 'Batch enrichment: ');
     setBannerMessage({
       type: 'info',
-      text: `Contact scan finished: updated ${res.enriched} leads (${res.phones} phone numbers, ${res.emails} emails found). Ready for CSV or Excel export.`,
+      text: `Enrichment finished: updated ${res.enriched} leads (${res.websites} websites, ${res.emails} emails, ${res.phones} phones, ${res.projects} live/won projects). Ready for CSV or Excel export.`,
     });
   };
 
@@ -382,18 +427,40 @@ export default function App() {
       if (parsed.length === 0) {
         setBannerMessage({
           type: 'error',
-          text: `No valid company rows found in ${file.name}. Ensure it has a Company Name header.`,
+          text: `No valid company rows found in ${file.name}. Ensure it has a Company Name header (and optional Nmbs/Phone column).`,
         });
       } else {
-        const { merged, addedCount, duplicateCount } = mergeLeadsDeduplicated(leads, parsed);
+        const rescoredParsed = rescoreAllLeads(parsed, scoringConfig);
+        const { merged, addedCount, duplicateCount } = mergeLeadsDeduplicated(leads, rescoredParsed);
         setLeads(merged);
         if (!selectedLeadId && merged.length > 0) {
           setSelectedLeadId(merged[0].id);
         }
-        setBannerMessage({
-          type: 'info',
-          text: `Imported ${file.name}: ${addedCount} new leads added, ${duplicateCount} duplicates merged.`,
-        });
+
+        const importedKeys = new Set(rescoredParsed.map((p) => p.normalized_name));
+        const toEnrich = merged.filter(
+          (l) =>
+            importedKeys.has(l.normalized_name) &&
+            (!l.business_email || !l.business_phone || !l.website || !l.project_name || !l.city),
+        );
+
+        const importSummary = `Imported ${file.name}: ${addedCount} new leads added (${duplicateCount} duplicates merged).`;
+        if (autoFindContacts && toEnrich.length > 0) {
+          const cap = Math.min(100, toEnrich.length);
+          const res = await enrichLeadsContacts(
+            toEnrich.slice(0, cap),
+            `${importSummary} Auto-enriching info: `,
+          );
+          setBannerMessage({
+            type: 'info',
+            text: `${importSummary} Auto-enriched ${res.enriched} companies (${res.websites} websites, ${res.emails} emails, ${res.phones} phones, ${res.projects} USASpending projects) and auto-scored into Warm/Potential.`,
+          });
+        } else {
+          setBannerMessage({
+            type: 'info',
+            text: `${importSummary} Click "Find Missing Contacts" to enrich websites, emails & projects.`,
+          });
+        }
       }
     } catch {
       setBannerMessage({ type: 'error', text: `Failed to read ${file.name}.` });
@@ -924,7 +991,7 @@ export default function App() {
                         Ready to hunt real US construction leads
                       </h2>
                       <p className="text-xs text-slate-500 max-w-md mx-auto leading-relaxed">
-                        Click <strong>Hunt Live US Leads</strong> above to pull real contractors and active projects from USASpending.gov and public city permit portals, or import a CSV from your local Python pipeline.
+                        Click <strong>Hunt Projects + Contacts</strong> above to pull active US contractors, or import an Excel/CSV file with <strong>Nmbs + Company Name</strong> to automatically find websites, emails, live projects, and score Warm/Potential leads.
                       </p>
                       <div className="pt-2 flex items-center justify-center gap-3">
                         <button
@@ -934,7 +1001,7 @@ export default function App() {
                           className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-700 rounded-md transition-colors whitespace-nowrap"
                         >
                           <Sparkles className="w-3.5 h-3.5" />
-                          {hunting ? 'Hunting Live Leads...' : 'Hunt Live US Leads'}
+                          {hunting ? 'Hunting Live Leads...' : 'Hunt Projects + Contacts'}
                         </button>
                         <button
                           type="button"
@@ -942,7 +1009,7 @@ export default function App() {
                           className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 whitespace-nowrap"
                         >
                           <FolderUp className="w-3.5 h-3.5" />
-                          Import CSV
+                          Import Excel / CSV
                         </button>
                       </div>
                     </div>

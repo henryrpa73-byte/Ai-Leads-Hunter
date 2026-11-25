@@ -61,9 +61,11 @@ export function DailyQuotaTracker({
             onChange={(e) => onChangeDailyTier(Number(e.target.value))}
             className="h-7 px-2 text-xs bg-white border border-slate-200 rounded text-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-900"
           >
-            <option value={100}>Conservative (100 / day)</option>
-            <option value={150}>Standard (150 / day)</option>
-            <option value={300}>High Volume (300 / day)</option>
+            <option value={100}>Starter (100 / day)</option>
+            <option value={150}>Conservative (150 / day)</option>
+            <option value={300}>Standard (300 / day)</option>
+            <option value={500}>Growth (500 / day)</option>
+            <option value={1000}>High Volume (1,000 / day)</option>
           </select>
 
           {hasAnyUsage && (

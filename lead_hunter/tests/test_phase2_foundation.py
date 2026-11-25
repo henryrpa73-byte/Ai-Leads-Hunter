@@ -130,6 +130,24 @@ class TestDatabaseAndImport(unittest.TestCase):
                 sheet_xml = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
                 self.assertIn("Apex", sheet_xml)
 
+    def test_nmbs_and_company_name_alias_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db = LeadDatabase(tmp / "nmbs_leads.db")
+            csv_path = tmp / "nmbs_companies.csv"
+            csv_path.write_text(
+                "Nmbs,Company Name\n"
+                "512-555-0188,Lonestar Millwork Builders LLC\n"
+                "3035550199,Front Range Commercial Builders\n",
+                encoding="utf-8",
+            )
+            summary = import_file(db, csv_path, source_name="NmbsSheet")
+            self.assertEqual(summary.inserted, 2)
+            leads = db.get_all_leads()
+            phones = {l["company_name"]: l["business_phone"] for l in leads}
+            self.assertEqual(phones["Lonestar Millwork Builders LLC"], "(512) 555-0188")
+            self.assertEqual(phones["Front Range Commercial Builders"], "(303) 555-0199")
+
 
 if __name__ == "__main__":
     unittest.main()

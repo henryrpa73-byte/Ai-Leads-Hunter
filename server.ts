@@ -642,6 +642,192 @@ async function resolvePublicWebsiteAndContacts(companyName: string, city: string
   return { website: foundWebsite, phone: foundPhone, email: foundEmail };
 }
 
+const GENERIC_CONSTRUCTION_WORDS = new Set([
+  'construction', 'contractors', 'contractor', 'builders', 'builder', 'contracting',
+  'architects', 'architectural', 'architecture', 'design', 'build', 'millwork',
+  'cabinet', 'cabinets', 'cabinetry', 'carpentry', 'woodwork', 'general', 'commercial',
+  'residential', 'custom', 'enterprises', 'enterprise', 'associates', 'partners',
+  'industries', 'industrial', 'development', 'properties', 'homes', 'usa', 'america',
+]);
+
+async function lookupCompanyUsaSpendingProject(
+  companyName: string,
+  stateFilter: string,
+): Promise<{
+  project_name: string;
+  project_description: string;
+  project_location: string;
+  project_status: string;
+  project_source_url: string;
+  buying_intent_evidence: string;
+  company_category: string;
+  services: string;
+  city: string;
+  state: string;
+  zip_code: string;
+  contact_person: string;
+  job_title: string;
+} | null> {
+  const allTokens = extractTokens(companyName);
+  const distinctiveTokens = allTokens.filter((t) => !GENERIC_CONSTRUCTION_WORDS.has(t));
+  const matchTokens = (distinctiveTokens.length > 0 ? distinctiveTokens : allTokens).slice(0, 3);
+  const searchName = allTokens.slice(0, 5).join(' ').toUpperCase();
+  if (!searchName || matchTokens.length === 0) return null;
+
+  const end = new Date();
+  const start = new Date(end.getTime() - 730 * 24 * 60 * 60 * 1000);
+  const locationFilter: Record<string, string> = { country: 'USA' };
+  if (/^[A-Z]{2}$/.test(stateFilter)) {
+    locationFilter.state = stateFilter;
+  }
+
+  const runSearch = async (useState: boolean) => {
+    const body = {
+      fields: [
+        'Award ID',
+        'Recipient Name',
+        'Award Amount',
+        'Description',
+        'Start Date',
+        'End Date',
+        'Awarding Agency',
+        'Place of Performance State Code',
+        'Place of Performance Zip5',
+        'generated_internal_id',
+      ],
+      filters: {
+        award_type_codes: ['A', 'B', 'C', 'D'],
+        recipient_search_text: [searchName],
+        place_of_performance_locations: [useState ? locationFilter : { country: 'USA' }],
+        time_period: [{ start_date: start.toISOString().slice(0, 10), end_date: end.toISOString().slice(0, 10) }],
+      },
+      limit: 5,
+      page: 1,
+      sort: 'Award Amount',
+      order: 'desc',
+    };
+    const data = (await fetchJsonWithTimeout(
+      'https://api.usaspending.gov/api/v2/search/spending_by_award/',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      7500,
+    )) as { results?: Array<Record<string, unknown>> };
+    return data.results || [];
+  };
+
+  let rows: Array<Record<string, unknown>> = [];
+  try {
+    rows = await runSearch(Boolean(locationFilter.state));
+    if (rows.length === 0 && locationFilter.state) {
+      rows = await runSearch(false);
+    }
+  } catch {
+    return null;
+  }
+
+  const matchedRow = rows.find((row) => {
+    const recTokens = extractTokens(String(row['Recipient Name'] || ''));
+    if (recTokens.length === 0) return false;
+    return matchTokens.every((tok) => recTokens.some((rt) => rt === tok || (tok.length >= 4 && rt.startsWith(tok))));
+  });
+
+  if (!matchedRow) return null;
+
+  const genId = String(matchedRow['generated_internal_id'] || '');
+  const awardId = String(matchedRow['Award ID'] || '');
+  const desc = String(matchedRow['Description'] || '');
+  const agency = String(matchedRow['Awarding Agency'] || '');
+  const startDt = String(matchedRow['Start Date'] || '').slice(0, 10);
+  let endDt = String(matchedRow['End Date'] || '').slice(0, 10);
+  const rawAmount = typeof matchedRow['Award Amount'] === 'number' ? matchedRow['Award Amount'] : null;
+  const amountText = rawAmount && rawAmount > 0 ? `$${Math.round(rawAmount).toLocaleString('en-US')}` : '';
+
+  let city = '';
+  let state = String(matchedRow['Place of Performance State Code'] || '');
+  let zip = String(matchedRow['Place of Performance Zip5'] || '');
+  let popLocation = state;
+  let contactPerson = '';
+  let jobTitle = '';
+  let categories: string[] = [];
+
+  if (genId) {
+    try {
+      const detail = (await fetchJsonWithTimeout(
+        `https://api.usaspending.gov/api/v2/awards/${encodeURIComponent(genId)}/`,
+        {},
+        6500,
+      )) as {
+        recipient?: {
+          business_categories?: string[];
+          location?: { city_name?: string; state_code?: string; zip5?: string };
+        };
+        executive_details?: { officers?: Array<{ name?: string | null }> };
+        period_of_performance?: { end_date?: string | null; potential_end_date?: string | null };
+        place_of_performance?: { city_name?: string; state_code?: string };
+      };
+      const rec = detail.recipient;
+      if (rec?.location?.city_name) {
+        city = rec.location.city_name.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+      }
+      if (rec?.location?.state_code) state = rec.location.state_code;
+      if (rec?.location?.zip5) zip = rec.location.zip5;
+      if (Array.isArray(rec?.business_categories)) categories = rec.business_categories;
+      const popCity = detail.place_of_performance?.city_name || '';
+      const popState = detail.place_of_performance?.state_code || state;
+      popLocation = [popCity, popState].filter(Boolean).join(', ');
+      const officerName = (detail.executive_details?.officers || []).find((o) => o?.name)?.name || '';
+      if (officerName) {
+        contactPerson = officerName.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+        jobTitle = 'Executive Officer';
+      }
+      const detEnd = String(
+        detail.period_of_performance?.end_date || detail.period_of_performance?.potential_end_date || '',
+      ).slice(0, 10);
+      if (detEnd) endDt = detEnd;
+    } catch {
+      // Fall back to search-level fields if award detail times out
+    }
+  }
+
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const projectStatus = endDt
+    ? endDt >= todayIso
+      ? `Live Won Project (ends ${endDt})`
+      : `Awarded Federal Contract (ended ${endDt})`
+    : startDt
+      ? 'Awarded'
+      : 'Active';
+
+  return {
+    project_name: awardId ? `Federal Award ${awardId}` : 'Federal Contract Award',
+    project_description: desc.slice(0, 450),
+    project_location: popLocation,
+    project_status: projectStatus,
+    project_source_url: genId
+      ? `https://www.usaspending.gov/award/${genId}`
+      : 'https://www.usaspending.gov/search',
+    buying_intent_evidence: [
+      awardId ? `Federal award ${awardId}` : 'Federal award',
+      amountText ? `Value: ${amountText}` : '',
+      agency ? `Agency: ${agency}` : '',
+      startDt ? `Start: ${startDt}` : '',
+      projectStatus,
+    ]
+      .filter(Boolean)
+      .join('; '),
+    company_category: categories[0] || '',
+    services: categories.slice(0, 4).join(', '),
+    city,
+    state,
+    zip_code: zip,
+    contact_person: contactPerson,
+    job_title: jobTitle,
+  };
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
@@ -716,6 +902,7 @@ async function startServer() {
         website?: string;
         city?: string;
         state?: string;
+        needs_project?: boolean;
       }>;
 
       const results: Array<{
@@ -726,6 +913,16 @@ async function startServer() {
         contact_person: string;
         job_title: string;
         services: string;
+        city: string;
+        state: string;
+        zip_code: string;
+        company_category: string;
+        project_name: string;
+        project_description: string;
+        project_location: string;
+        project_status: string;
+        project_source_url: string;
+        buying_intent_evidence: string;
       }> = [];
 
       const concurrency = 3;
@@ -736,18 +933,45 @@ async function startServer() {
             const id = String(item.id || '');
             const company = String(item.company_name || '').trim();
             let site = String(item.website || '').trim();
+            let city = String(item.city || '').trim();
+            let state = String(item.state || '').trim().toUpperCase().slice(0, 2);
+            let zipCode = '';
             let phone = '';
             let email = '';
             let contactPerson = '';
             let jobTitle = '';
             let services = '';
+            let companyCategory = '';
+            let projectName = '';
+            let projectDescription = '';
+            let projectLocation = '';
+            let projectStatus = '';
+            let projectSourceUrl = '';
+            let buyingIntentEvidence = '';
+
+            if (company && (item.needs_project || !city || !state)) {
+              const usa = await lookupCompanyUsaSpendingProject(company, state);
+              if (usa) {
+                projectName = usa.project_name;
+                projectDescription = usa.project_description;
+                projectLocation = usa.project_location;
+                projectStatus = usa.project_status;
+                projectSourceUrl = usa.project_source_url;
+                buyingIntentEvidence = usa.buying_intent_evidence;
+                companyCategory = usa.company_category;
+                services = usa.services;
+                if (!city && usa.city) city = usa.city;
+                if (usa.state && (!state || !item.city)) state = usa.state;
+                if (usa.zip_code) zipCode = usa.zip_code;
+                if (usa.contact_person) {
+                  contactPerson = usa.contact_person;
+                  jobTitle = usa.job_title;
+                }
+              }
+            }
 
             if (!site && company) {
-              const resolved = await resolvePublicWebsiteAndContacts(
-                company,
-                String(item.city || '').trim(),
-                String(item.state || '').trim(),
-              );
+              const resolved = await resolvePublicWebsiteAndContacts(company, city, state);
               site = resolved.website;
               phone = resolved.phone;
               email = resolved.email;
@@ -759,11 +983,13 @@ async function startServer() {
                 site = scraped.website || site;
                 email = scraped.email || email;
                 phone = scraped.phone || phone;
-                contactPerson = scraped.contact_person || '';
-                jobTitle = scraped.job_title || '';
-                services = scraped.services || '';
+                if (scraped.contact_person) {
+                  contactPerson = scraped.contact_person;
+                  jobTitle = scraped.job_title || jobTitle;
+                }
+                services = [scraped.services, services].filter(Boolean).join(', ');
               } catch {
-                // Keep any directory website/phone/email found without failing batch
+                // Keep any directory website/phone/email/project found without failing batch
               }
             }
 
@@ -775,6 +1001,16 @@ async function startServer() {
               contact_person: contactPerson,
               job_title: jobTitle,
               services,
+              city,
+              state,
+              zip_code: zipCode,
+              company_category: companyCategory,
+              project_name: projectName,
+              project_description: projectDescription,
+              project_location: projectLocation,
+              project_status: projectStatus,
+              project_source_url: projectSourceUrl,
+              buying_intent_evidence: buyingIntentEvidence,
             };
           }),
         );
@@ -784,7 +1020,10 @@ async function startServer() {
       const websitesFound = results.filter((r) => Boolean(r.website)).length;
       const emailsFound = results.filter((r) => Boolean(r.email)).length;
       const phonesFound = results.filter((r) => Boolean(r.phone)).length;
-      const enriched = results.filter((r) => Boolean(r.website || r.email || r.phone || r.contact_person)).length;
+      const projectsFound = results.filter((r) => Boolean(r.project_name)).length;
+      const enriched = results.filter((r) =>
+        Boolean(r.website || r.email || r.phone || r.contact_person || r.project_name),
+      ).length;
 
       return res.json({
         results,
@@ -794,6 +1033,7 @@ async function startServer() {
           websitesFound,
           emailsFound,
           phonesFound,
+          projectsFound,
         },
       });
     } catch (err) {

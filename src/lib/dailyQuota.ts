@@ -21,7 +21,7 @@ export function getTodayDateKey(): string {
   return `${y}-${m}-${d}`;
 }
 
-export function createDefaultQuota(discoveryLimit = 150, contactLimit = 150): DailyQuotaState {
+export function createDefaultQuota(discoveryLimit = 300, contactLimit = 300): DailyQuotaState {
   return {
     date: getTodayDateKey(),
     discoveryLeadsToday: 0,
@@ -42,8 +42,8 @@ export function loadDailyQuota(): DailyQuotaState {
     const raw = localStorage.getItem(QUOTA_STORAGE_KEY);
     if (!raw) return createDefaultQuota();
     const parsed = JSON.parse(raw) as Partial<DailyQuotaState>;
-    const dLimit = typeof parsed.discoveryLimit === 'number' && parsed.discoveryLimit > 0 ? parsed.discoveryLimit : 150;
-    const cLimit = typeof parsed.contactLimit === 'number' && parsed.contactLimit > 0 ? parsed.contactLimit : 150;
+    const dLimit = typeof parsed.discoveryLimit === 'number' && parsed.discoveryLimit > 0 ? parsed.discoveryLimit : 300;
+    const cLimit = typeof parsed.contactLimit === 'number' && parsed.contactLimit > 0 ? parsed.contactLimit : 300;
 
     if (parsed.date !== today) {
       return createDefaultQuota(dLimit, cLimit);
