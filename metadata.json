@@ -1,6 +1,6 @@
 {
   "name": "Ai Leads Hunter",
-  "description": "",
+  "description": "US construction B2B lead discovery, qualification, and scoring platform for Estimation, Architectural, and Millwork services.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

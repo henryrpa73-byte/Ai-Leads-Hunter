@@ -118,6 +118,18 @@ class TestDatabaseAndImport(unittest.TestCase):
                 rows = list(csv.DictReader(f))
             self.assertEqual(len(rows), 2)
 
+            import zipfile
+            from src.importer import export_leads_xlsx
+
+            xlsx_path = tmp / "exported.xlsx"
+            xcount = export_leads_xlsx(db, xlsx_path)
+            self.assertEqual(xcount, 2)
+            self.assertTrue(xlsx_path.exists())
+            with zipfile.ZipFile(xlsx_path, "r") as zf:
+                self.assertIn("xl/worksheets/sheet1.xml", zf.namelist())
+                sheet_xml = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
+                self.assertIn("Apex", sheet_xml)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-"""Automated tests for Phase 3 Contractor Discovery and Website Research."""
+"""Automated tests for Phase 3 Contractor Discovery and Contact Enrichment."""
 
 from __future__ import annotations
 
@@ -40,6 +40,13 @@ class TestPhase3Discovery(unittest.TestCase):
                     "business_categories": ["Small Business", "General Contractor"],
                     "location": {"city_name": "AUSTIN", "state_code": "TX", "zip5": "78701"},
                 },
+                "executive_details": {
+                    "officers": [{"name": "SARAH JENKINS", "amount": 250000.0}],
+                },
+                "period_of_performance": {
+                    "start_date": "2026-09-01",
+                    "end_date": "2027-06-30",
+                },
                 "place_of_performance": {"city_name": "AUSTIN", "state_code": "TX", "zip5": "78701"},
             }
 
@@ -59,6 +66,8 @@ class TestPhase3Discovery(unittest.TestCase):
             leads = db.get_all_leads()
             self.assertEqual(len(leads), 1)
             self.assertEqual(leads[0]["state"], "TX")
+            self.assertEqual(leads[0]["contact_person"], "Sarah Jenkins")
+            self.assertIn("Live Won Project", leads[0]["project_status"])
             self.assertIn("usaspending.gov/award/CONT_AWD_W91234", leads[0]["project_source_url"])
 
     def test_permit_portals_discovery(self) -> None:
@@ -72,8 +81,11 @@ class TestPhase3Discovery(unittest.TestCase):
                         "description": "Interior architectural remodel and custom cabinetry",
                         "permit_location": "400 CONGRESS AVE",
                         "issue_date": "2026-11-10T00:00:00.000",
+                        "expiresdate": "2027-05-10T00:00:00.000",
                         "status_current": "Active",
                         "contractor_company_name": "Capitol Millwork Builders LLC",
+                        "contractor_full_name": "Carlos Mendez",
+                        "contractor_trade": "General Contractor",
                         "contractor_phone": "512-555-0188",
                         "original_zip": "78701",
                     }
@@ -108,6 +120,9 @@ class TestPhase3Discovery(unittest.TestCase):
             self.assertEqual(res.inserted, 2)
             leads = db.get_all_leads()
             self.assertEqual({l["state"] for l in leads}, {"TX", "IL"})
+            tx_lead = next(l for l in leads if l["state"] == "TX")
+            self.assertEqual(tx_lead["contact_person"], "Carlos Mendez")
+            self.assertEqual(tx_lead["business_phone"], "(512) 555-0188")
 
     def test_sam_graceful_skip_without_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -116,21 +131,34 @@ class TestPhase3Discovery(unittest.TestCase):
             self.assertEqual(res.fetched, 0)
             self.assertIn("SAM_GOV_API_KEY", res.skipped_reason)
 
-    def test_company_website_research_respects_robots_and_extracts_signals(self) -> None:
-        sample_html = """
+    def test_company_website_research_respects_robots_and_extracts_contacts(self) -> None:
+        home_html = """
         <html>
           <head><title>Apex Millwork &amp; Estimating</title></head>
           <body>
             <h1>Commercial Millwork Shop Drawings &amp; Preconstruction Estimating</h1>
-            <p>Contact our estimating desk at bids@apexmillwork.org or (512) 555-0177.</p>
+            <p>General inquiries: info@apexmillwork.org</p>
           </body>
         </html>
         """
-        signals = extract_company_signals(sample_html, "https://apexmillwork.org")
+        contact_html = """
+        <html>
+          <body>
+            <p>David Miller - Chief Estimator</p>
+            <p>Send bid packages to bids@apexmillwork.org or call (512) 555-0177.</p>
+          </body>
+        </html>
+        """
+        signals = extract_company_signals(contact_html, "https://apexmillwork.org/contact")
         self.assertEqual(signals["emails"], ["bids@apexmillwork.org"])
         self.assertEqual(signals["phones"], ["(512) 555-0177"])
-        self.assertIn("Millwork / Cabinetry", signals["services"])
-        self.assertIn("Estimating / Bidding", signals["services"])
+        self.assertEqual(signals["contacts"][0]["name"], "David Miller")
+        self.assertIn("Chief Estimator", signals["contacts"][0]["title"])
+
+        def fake_fetch(url, user_agent=""):
+            if url.endswith("/contact"):
+                return contact_html
+            return home_html
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db = LeadDatabase(Path(tmpdir) / "web.db")
@@ -142,11 +170,34 @@ class TestPhase3Discovery(unittest.TestCase):
                 limit=5,
                 request_delay=0,
                 robots_checker=lambda url, ua: "allowed.org" in url,
-                html_fetcher=lambda url, user_agent="": sample_html,
+                html_fetcher=fake_fetch,
             )
             self.assertEqual(summary.checked, 2)
             self.assertEqual(summary.updated, 1)
             self.assertEqual(summary.blocked_or_disallowed, 1)
+
+            allowed_row = next(l for l in db.get_all_leads() if l["company_name"] == "Allowed Co")
+            self.assertEqual(allowed_row["business_email"], "bids@apexmillwork.org")
+            self.assertEqual(allowed_row["business_phone"], "(512) 555-0177")
+            self.assertEqual(allowed_row["contact_person"], "David Miller")
+
+    def test_mailto_tel_links_and_domain_matching(self) -> None:
+        from src.agents.company_research import _page_matches_company
+
+        html = """
+        <html>
+          <head><title>Kuchar Construction LLC | Commercial Builders</title></head>
+          <body>
+            <a href="mailto:estimating@kucharconstruction.com">Email Estimating</a>
+            <a href="tel:+15125550191">Call Us</a>
+          </body>
+        </html>
+        """
+        sig = extract_company_signals(html, "https://www.kucharconstruction.com")
+        self.assertEqual(sig["emails"], ["estimating@kucharconstruction.com"])
+        self.assertEqual(sig["phones"], ["(512) 555-0191"])
+        self.assertTrue(_page_matches_company("KUCHAR CONSTRUCTION, LLC", html))
+        self.assertFalse(_page_matches_company("KUCHAR CONSTRUCTION, LLC", "<html><body>This domain is for sale GoDaddy</body></html>"))
 
 
 if __name__ == "__main__":

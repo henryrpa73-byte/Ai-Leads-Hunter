@@ -69,6 +69,27 @@ def _infer_service_hint(naics_code: str, description: str) -> str:
     return "Construction Estimation"
 
 
+def _extract_officer_contact(detail: dict) -> tuple[str, str]:
+    exec_details = detail.get("executive_details") or {}
+    officers = exec_details.get("officers") or []
+    for officer in officers:
+        name = str(officer.get("name") or "").strip()
+        if name:
+            return name.title(), "Executive Officer"
+    return "", ""
+
+
+def _determine_live_status(detail: dict, start_date: str) -> str:
+    perf = detail.get("period_of_performance") or {}
+    end_date = str(perf.get("end_date") or perf.get("potential_end_date") or "")[:10]
+    today = datetime.now(timezone.utc).date().isoformat()
+    if end_date:
+        if end_date >= today:
+            return f"Live Won Project (ends {end_date})"
+        return f"Completed Award (ended {end_date})"
+    return "Awarded" if start_date else "Active"
+
+
 def award_to_lead(search_row: dict, detail: dict | None = None, naics_code: str = "") -> LeadRecord:
     detail = detail or {}
     recipient = detail.get("recipient") or {}
@@ -91,6 +112,9 @@ def award_to_lead(search_row: dict, detail: dict | None = None, naics_code: str 
     description = str(search_row.get("Description") or "").strip()
     start_date = str(search_row.get("Start Date") or "").strip()
 
+    contact_person, job_title = _extract_officer_contact(detail)
+    project_status = _determine_live_status(detail, start_date)
+
     source_url = f"https://www.usaspending.gov/award/{gen_id}" if gen_id else "https://www.usaspending.gov/search"
     amount_str = f"${float(amount):,.0f}" if isinstance(amount, (int, float)) else ""
     categories = ", ".join(recipient.get("business_categories") or [])
@@ -101,10 +125,13 @@ def award_to_lead(search_row: dict, detail: dict | None = None, naics_code: str 
         f"Value: {amount_str}" if amount_str else "",
         f"Agency: {agency}" if agency else "",
         f"Start: {start_date}" if start_date else "",
+        project_status,
     ) if p]
 
     return LeadRecord(
         company_name=company_name,
+        contact_person=contact_person,
+        job_title=job_title,
         city=city,
         state=state,
         zip_code=zip_code,
@@ -114,7 +141,7 @@ def award_to_lead(search_row: dict, detail: dict | None = None, naics_code: str 
         project_name=f"Federal Award {award_id}" if award_id else "Federal Construction Award",
         project_description=description[:500],
         project_location=project_location,
-        project_status="Awarded" if start_date else "Active",
+        project_status=project_status,
         project_source_url=source_url,
         company_source_url=source_url,
         buying_intent_evidence="; ".join(evidence_parts),

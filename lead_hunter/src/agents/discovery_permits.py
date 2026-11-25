@@ -81,16 +81,22 @@ def _row_to_lead(portal_key: str, row: dict, portal_cfg: dict) -> LeadRecord | N
         work_class = str(row.get("work_class") or row.get("permit_type_desc") or "").strip()
         location = str(row.get("permit_location") or row.get("original_address1") or "").strip()
         issue_date = str(row.get("issue_date") or "")[:10]
+        expires_date = str(row.get("expiresdate") or "")[:10]
         phone = str(row.get("contractor_phone") or "").strip()
+        contact_person = str(row.get("contractor_full_name") or "").strip()
+        job_title = str(row.get("contractor_trade") or "Project Contractor").strip()
         city = str(row.get("contractor_city") or portal_cfg["city"]).strip()
         state = str(row.get("contractor_state") or portal_cfg["state"]).strip()
         zip_code = str(row.get("contractor_zip") or row.get("original_zip") or "").strip()
         permit_url = f"{portal_cfg['url']}?permit_number={urllib.parse.quote(permit_num)}" if permit_num else portal_cfg["portal_base"]
-        status = str(row.get("status_current") or "Issued").strip()
+        raw_status = str(row.get("status_current") or "Active").strip()
+        status = f"Live {raw_status} Permit (expires {expires_date})" if expires_date else f"Live {raw_status} Permit"
 
         return LeadRecord(
             company_name=company,
             business_phone=phone,
+            contact_person=contact_person,
+            job_title=job_title,
             city=city,
             state=state,
             zip_code=zip_code,
@@ -139,7 +145,7 @@ def _row_to_lead(portal_key: str, row: dict, portal_cfg: dict) -> LeadRecord | N
             project_name=f"Chicago Permit {permit_num}".strip(),
             project_description=desc[:500],
             project_location=f"{street}, Chicago, IL".strip(", "),
-            project_status="Issued",
+            project_status="Live Issued Permit",
             project_source_url=permit_url,
             company_source_url=portal_cfg["portal_base"],
             buying_intent_evidence=evidence,

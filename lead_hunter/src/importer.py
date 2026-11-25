@@ -242,3 +242,94 @@ def export_leads_csv(db: LeadDatabase, output_path: Path, min_score: int = 0, ti
         for row in leads:
             writer.writerow(row)
     return len(leads)
+
+
+def _col_letter(idx_1based: int) -> str:
+    letters = []
+    n = idx_1based
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters.append(chr(65 + rem))
+    return "".join(reversed(letters))
+
+
+def export_leads_xlsx(db: LeadDatabase, output_path: Path, min_score: int = 0, tier: str | None = None) -> int:
+    """Export leads to a clean .xlsx workbook (uses openpyxl if available, or pure stdlib OpenXML)."""
+    leads = db.get_all_leads(min_score=min_score, tier=tier)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    headers = list(LEAD_FIELDS)
+
+    try:
+        import openpyxl  # type: ignore
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Leads"
+        ws.append(headers)
+        for row in leads:
+            ws.append([row.get(col, "") for col in headers])
+        ws.freeze_panes = "A2"
+        wb.save(output_path)
+        return len(leads)
+    except ImportError:
+        pass
+
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    rows_xml = []
+    all_rows = [headers] + [[row.get(col, "") for col in headers] for row in leads]
+    for r_idx, row_vals in enumerate(all_rows, start=1):
+        cells = []
+        for c_idx, val in enumerate(row_vals, start=1):
+            ref = f"{_col_letter(c_idx)}{r_idx}"
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                cells.append(f'<c r="{ref}"><v>{val}</v></c>')
+            else:
+                text = escape(str(val or ""))
+                cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>')
+        rows_xml.append(f'<row r="{r_idx}">{"".join(cells)}</row>')
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(rows_xml)}</sheetData>'
+        '</worksheet>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Leads" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'
+    )
+
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+    return len(leads)

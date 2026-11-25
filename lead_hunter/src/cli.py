@@ -13,7 +13,7 @@ from .agents.discovery_sam import discover_sam_opportunities
 from .agents.discovery_usaspending import discover_usaspending
 from .config import get_settings
 from .database import LeadDatabase
-from .importer import export_leads_csv, import_file
+from .importer import export_leads_csv, export_leads_xlsx, import_file
 from .logger import setup_logger
 
 
@@ -39,6 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--min-score", type=int, default=0, help="Minimum lead score filter")
     exp.add_argument("--tier", choices=["Warm", "Potential", "Unqualified"], default=None)
 
+    expx = sub.add_parser("export-xlsx", help="Export leads from SQLite to Excel (.xlsx)")
+    expx.add_argument("--out", default="", help="Output .xlsx path (defaults to data/exports/)")
+    expx.add_argument("--min-score", type=int, default=0, help="Minimum lead score filter")
+    expx.add_argument("--tier", choices=["Warm", "Potential", "Unqualified"], default=None)
+
     # Phase 3 commands
     usa = sub.add_parser("discover-usaspending", help="Discover US construction awards from USASpending.gov (no API key)")
     usa.add_argument("--state", default="", help="2-letter US state filter (e.g., TX)")
@@ -53,12 +58,23 @@ def build_parser() -> argparse.ArgumentParser:
     sam.add_argument("--days", type=int, default=30, help="Lookback days (default 30)")
     sam.add_argument("--limit", type=int, default=15, help="Max opportunities per NAICS code (default 15)")
 
-    dall = sub.add_parser("discover-all", help="Run all free public contractor discovery sources")
+    dall = sub.add_parser(
+        "discover-all",
+        help="Discover live/awarded projects, auto-find phones/emails, and export CSV or Excel",
+    )
     dall.add_argument("--state", default="", help="Optional 2-letter state for USASpending")
     dall.add_argument("--limit", type=int, default=10, help="Max records per source/category")
+    dall.add_argument("--no-auto-contacts", action="store_true", help="Skip automatic phone/email lookup after discovery")
+    dall.add_argument("--contact-limit", type=int, default=25, help="Max leads to enrich with contacts (default 25)")
+    dall.add_argument(
+        "--export-format",
+        choices=["csv", "xlsx", "both", "none"],
+        default="both",
+        help="Auto-export ready-to-import file after contact enrichment (default: both)",
+    )
 
-    web = sub.add_parser("research-websites", help="Respectfully enrich leads that have public websites")
-    web.add_argument("--limit", type=int, default=10, help="Max websites to inspect")
+    web = sub.add_parser("research-websites", help="Respectfully find websites, phones & emails for leads")
+    web.add_argument("--limit", type=int, default=15, help="Max leads to inspect")
 
     return parser
 
@@ -102,6 +118,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Exported {count} leads to {out_path}")
         return 0
 
+    if args.command == "export-xlsx":
+        out_path = (
+            Path(args.out)
+            if args.out
+            else settings.exports_dir / f"leads_export_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+        )
+        count = export_leads_xlsx(db, out_path, min_score=args.min_score, tier=args.tier)
+        print(f"Exported {count} leads to {out_path}")
+        return 0
+
     if args.command == "discover-usaspending":
         res = discover_usaspending(
             db,
@@ -142,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "discover-all":
-        results = [
+        discovery_results = [
             discover_usaspending(
                 db,
                 state=args.state,
@@ -167,7 +193,28 @@ def main(argv: list[str] | None = None) -> int:
                 logger=logger,
             ).__dict__,
         ]
-        print(json.dumps(results, indent=2))
+
+        contact_summary = None
+        if not args.no_auto_contacts:
+            contact_summary = research_company_websites(
+                db,
+                limit=args.contact_limit,
+                request_delay=settings.request_delay_seconds,
+                user_agent=settings.http_user_agent,
+                logger=logger,
+                resolve_missing_websites=True,
+            ).__dict__
+
+        exports = {}
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if args.export_format in ("csv", "both"):
+            csv_path = settings.exports_dir / f"leads_ready_{stamp}.csv"
+            exports["csv"] = {"path": str(csv_path), "rows": export_leads_csv(db, csv_path)}
+        if args.export_format in ("xlsx", "both"):
+            xlsx_path = settings.exports_dir / f"leads_ready_{stamp}.xlsx"
+            exports["xlsx"] = {"path": str(xlsx_path), "rows": export_leads_xlsx(db, xlsx_path)}
+
+        print(json.dumps({"discovery": discovery_results, "contacts": contact_summary, "exports": exports}, indent=2))
         return 0
 
     if args.command == "research-websites":
