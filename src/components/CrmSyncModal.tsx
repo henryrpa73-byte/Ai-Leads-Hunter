@@ -223,7 +223,7 @@ export function CrmSyncModal({
                     : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
                 }`}
               >
-                All Warm Leads ({warmLeads.length})
+                All Hot &amp; Warm Leads ({warmLeads.length})
               </button>
             </div>
 
@@ -317,7 +317,7 @@ export function CrmSyncModal({
                 onChange={(e) => setMarkQueued(e.target.checked)}
                 className="rounded border-slate-300 text-slate-900 focus:ring-slate-900"
               />
-              Update synced leads&apos; Outreach Status to &quot;Queued&quot;
+              Update synced leads&apos; Outreach Status to &quot;Ready for Calling&quot;
             </label>
           </div>
 

@@ -17,39 +17,42 @@ interface AutomatedScoringEngineProps {
 
 const PRESETS: Array<{ label: string; config: ScoringCriteriaConfig }> = [
   {
-    label: 'Balanced',
+    label: 'Cost Bidding Standard',
     config: DEFAULT_SCORING_CONFIG,
   },
   {
     label: 'Winter 2D/3D & SMS',
     config: {
-      warmThreshold: 65,
+      hotThreshold: 80,
+      warmThreshold: 60,
       projectValueWeight: 20,
       companySizeWeight: 15,
-      serviceMatchWeight: 40,
-      activityReachWeight: 25,
+      serviceMatchWeight: 35,
+      activityReachWeight: 30,
       smsFocus: true,
     },
   },
   {
     label: 'High-Value Projects',
     config: {
-      warmThreshold: 70,
-      projectValueWeight: 45,
+      hotThreshold: 85,
+      warmThreshold: 65,
+      projectValueWeight: 40,
       companySizeWeight: 20,
       serviceMatchWeight: 20,
-      activityReachWeight: 15,
+      activityReachWeight: 20,
       smsFocus: false,
     },
   },
   {
-    label: 'Service Match Focus',
+    label: 'Takeoff & Estimating Fit',
     config: {
-      warmThreshold: 65,
+      hotThreshold: 80,
+      warmThreshold: 60,
       projectValueWeight: 20,
       companySizeWeight: 15,
-      serviceMatchWeight: 45,
-      activityReachWeight: 20,
+      serviceMatchWeight: 40,
+      activityReachWeight: 25,
       smsFocus: false,
     },
   },
@@ -64,14 +67,14 @@ export function AutomatedScoringEngine({
   const [draft, setDraft] = useState<ScoringCriteriaConfig>(config);
 
   const summary = useMemo(() => {
+    const hotCount = leads.filter((l) => l.lead_tier === 'Hot').length;
     const warmCount = leads.filter((l) => l.lead_tier === 'Warm').length;
     const potentialCount = leads.filter((l) => l.lead_tier === 'Potential').length;
 
     const values = leads
-      .map((l) => extractProjectValueUsd(`${l.buying_intent_evidence} ${l.project_description}`))
+      .map((l) => extractProjectValueUsd(`${l.project_value || ''} ${l.buying_intent_evidence} ${l.project_description}`))
       .filter((v): v is number => v !== null && v > 0);
     const avgValue = values.length ? Math.round(values.reduce((s, v) => s + v, 0) / values.length) : null;
-    const highValueCount = values.filter((v) => v >= 250_000).length;
 
     let primeOrMidCount = 0;
     for (const l of leads) {
@@ -82,11 +85,10 @@ export function AutomatedScoringEngine({
     }
 
     return {
+      hotCount,
       warmCount,
       potentialCount,
       avgValue,
-      disclosedCount: values.length,
-      highValueCount,
       primeOrMidCount,
     };
   }, [leads]);
@@ -110,25 +112,26 @@ export function AutomatedScoringEngine({
       aria-label="Automated Lead Scoring"
       className="bg-white border border-slate-200 rounded-lg overflow-hidden"
     >
-      {/* Summary Header Bar */}
       <div className="px-4 py-3 flex flex-wrap items-center justify-between gap-4">
         <div className="space-y-0.5 min-w-0">
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <span className="font-semibold text-slate-900">Automated Lead Scoring Engine</span>
+            <span className="font-semibold text-slate-900">Cost Bidding 0–100 Scoring Rubric</span>
             <span className="text-slate-400" aria-hidden="true">·</span>
             <span className="text-slate-600">
-              Warm cutoff <span className="font-mono-tabular font-semibold text-amber-700">{config.warmThreshold}+</span>
+              Hot <span className="font-mono-tabular font-semibold text-red-700">{config.hotThreshold ?? 80}+</span>
+              {' · '}
+              Warm <span className="font-mono-tabular font-semibold text-amber-700">{config.warmThreshold}+</span>
             </span>
             <span className="text-slate-400 hidden sm:inline" aria-hidden="true">·</span>
             <span className="text-slate-500 hidden sm:inline font-mono-tabular">
-              Value {norm(config.projectValueWeight)}% · Size {norm(config.companySizeWeight)}% · Service {norm(config.serviceMatchWeight)}% · Activity {100 - norm(config.projectValueWeight) - norm(config.companySizeWeight) - norm(config.serviceMatchWeight)}%
+              Projects {norm(config.projectValueWeight)}% · Relevance {norm(config.companySizeWeight)}% · Trade/Service {norm(config.serviceMatchWeight)}% · Contact &amp; Source {100 - norm(config.projectValueWeight) - norm(config.companySizeWeight) - norm(config.serviceMatchWeight)}%
             </span>
           </div>
           <div className="text-[11px] text-slate-500 font-mono-tabular">
             {leads.length === 0
-              ? 'Evaluates every lead on Project Value, Company Size & Service Match to assign Warm or Potential'
-              : `Auto-classified ${summary.warmCount} Warm · ${summary.potentialCount} Potential · ${summary.primeOrMidCount} Prime/Mid-Market GCs${
-                  summary.avgValue ? ` · Avg Disclosed Value ${formatProjectValue(summary.avgValue)}` : ''
+              ? 'Deterministic 6-factor scoring (no points awarded for missing or unverified fields)'
+              : `${summary.hotCount} Hot · ${summary.warmCount} Warm · ${summary.potentialCount} Potential · ${summary.primeOrMidCount} Prime/Mid-Market GCs${
+                  summary.avgValue ? ` · Avg Value ${formatProjectValue(summary.avgValue)}` : ''
                 }`}
           </div>
         </div>
@@ -154,7 +157,6 @@ export function AutomatedScoringEngine({
         </div>
       </div>
 
-      {/* Expandable Weight & Rule Customizer */}
       {expanded && (
         <div className="border-t border-slate-200 bg-slate-50/60 p-4 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -172,36 +174,52 @@ export function AutomatedScoringEngine({
               ))}
             </div>
 
-            <div className="flex items-center gap-2">
-              <label htmlFor="warm-cutoff" className="text-xs font-medium text-slate-600">
-                Assign &apos;Warm&apos; at score:
-              </label>
-              <select
-                id="warm-cutoff"
-                value={draft.warmThreshold}
-                onChange={(e) => setDraft((p) => ({ ...p, warmThreshold: Number(e.target.value) }))}
-                className="h-8 px-2.5 text-xs bg-white border border-slate-300 rounded text-slate-900 font-mono-tabular"
-              >
-                <option value={60}>60+ (Broader Warm)</option>
-                <option value={65}>65+</option>
-                <option value={70}>70+ (Default)</option>
-                <option value={75}>75+ (Strict)</option>
-                <option value={80}>80+ (Top Priority Only)</option>
-              </select>
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2">
+                <label htmlFor="hot-cutoff" className="text-xs font-medium text-slate-600">
+                  Hot cutoff:
+                </label>
+                <select
+                  id="hot-cutoff"
+                  value={draft.hotThreshold ?? 80}
+                  onChange={(e) => setDraft((p) => ({ ...p, hotThreshold: Number(e.target.value) }))}
+                  className="h-8 px-2 text-xs bg-white border border-slate-300 rounded text-slate-900 font-mono-tabular"
+                >
+                  <option value={75}>75+</option>
+                  <option value={80}>80+ (Default)</option>
+                  <option value={85}>85+ (Strict)</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <label htmlFor="warm-cutoff" className="text-xs font-medium text-slate-600">
+                  Warm cutoff:
+                </label>
+                <select
+                  id="warm-cutoff"
+                  value={draft.warmThreshold}
+                  onChange={(e) => setDraft((p) => ({ ...p, warmThreshold: Number(e.target.value) }))}
+                  className="h-8 px-2 text-xs bg-white border border-slate-300 rounded text-slate-900 font-mono-tabular"
+                >
+                  <option value={55}>55+</option>
+                  <option value={60}>60+ (Default)</option>
+                  <option value={65}>65+</option>
+                  <option value={70}>70+</option>
+                </select>
+              </div>
             </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="bg-white border border-slate-200 rounded-md p-3 space-y-2">
               <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-slate-900">Project Value</span>
+                <span className="font-semibold text-slate-900">Active Projects &amp; Value</span>
                 <span className="font-mono-tabular font-semibold text-slate-700">
                   {norm(draft.projectValueWeight)} pts
                 </span>
               </div>
               <input
                 type="range"
-                aria-label="Project Value weight"
+                aria-label="Active Projects weight"
                 min={10}
                 max={55}
                 step={5}
@@ -212,20 +230,20 @@ export function AutomatedScoringEngine({
                 className="w-full accent-slate-900"
               />
               <p className="text-[11px] text-slate-500">
-                $1M+ awards score 100%, $250K+ score 85%, $50K+ score 65%.
+                Active contracts, permits, and disclosed project scale ($250K–$1M+).
               </p>
             </div>
 
             <div className="bg-white border border-slate-200 rounded-md p-3 space-y-2">
               <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-slate-900">Company Size</span>
+                <span className="font-semibold text-slate-900">Company Relevance</span>
                 <span className="font-mono-tabular font-semibold text-slate-700">
                   {norm(draft.companySizeWeight)} pts
                 </span>
               </div>
               <input
                 type="range"
-                aria-label="Company Size weight"
+                aria-label="Company Relevance weight"
                 min={5}
                 max={40}
                 step={5}
@@ -236,20 +254,20 @@ export function AutomatedScoringEngine({
                 className="w-full accent-slate-900"
               />
               <p className="text-[11px] text-slate-500">
-                Prime / Enterprise GCs score 100%, Mid-Market 80%, Specialty Trades 60%.
+                Verified GCs, subcontractors, architects, engineers, and design-build firms.
               </p>
             </div>
 
             <div className="bg-white border border-slate-200 rounded-md p-3 space-y-2">
               <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-slate-900">Service Match</span>
+                <span className="font-semibold text-slate-900">Trade &amp; Service Fit</span>
                 <span className="font-mono-tabular font-semibold text-slate-700">
                   {norm(draft.serviceMatchWeight)} pts
                 </span>
               </div>
               <input
                 type="range"
-                aria-label="Service Match weight"
+                aria-label="Trade and Service Fit weight"
                 min={10}
                 max={55}
                 step={5}
@@ -260,13 +278,13 @@ export function AutomatedScoringEngine({
                 className="w-full accent-slate-900"
               />
               <p className="text-[11px] text-slate-500">
-                Direct fit for Estimation, Architectural CAD, or Millwork shop drawings.
+                Match to Cost Bidding takeoffs, estimating, bid prep, and architectural support.
               </p>
             </div>
 
             <div className="bg-white border border-slate-200 rounded-md p-3 space-y-2">
               <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-slate-900">Activity &amp; Contact</span>
+                <span className="font-semibold text-slate-900">Decision-Maker &amp; Contact</span>
                 <span className="font-mono-tabular font-semibold text-slate-700">
                   {100 -
                     norm(draft.projectValueWeight) -
@@ -277,9 +295,9 @@ export function AutomatedScoringEngine({
               </div>
               <input
                 type="range"
-                aria-label="Activity and Contact weight"
+                aria-label="Decision-Maker and Contact weight"
                 min={5}
-                max={40}
+                max={45}
                 step={5}
                 value={draft.activityReachWeight}
                 onChange={(e) =>
@@ -288,7 +306,7 @@ export function AutomatedScoringEngine({
                 className="w-full accent-slate-900"
               />
               <p className="text-[11px] text-slate-500">
-                Live/won project status, verified source link, phone, email, and website.
+                Public estimator/PM name, listed phone/email/website, and primary source URL.
               </p>
             </div>
           </div>

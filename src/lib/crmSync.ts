@@ -112,8 +112,9 @@ export function mapLeadsToCrmRecords(leads: Lead[], platform: CrmPlatform): Arra
           city: lead.city,
           state: lead.state,
           zip: lead.zip_code,
-          hs_lead_status: lead.lead_tier === 'Warm' ? 'OPEN_DEAL' : 'NEW',
+          hs_lead_status: lead.lead_tier === 'Hot' || lead.lead_tier === 'Warm' ? 'OPEN_DEAL' : 'NEW',
           lead_score: lead.lead_score,
+          construction_trade: lead.construction_trade,
           service_opportunity: lead.service_opportunity,
           project_name: lead.project_name,
           description: note,
@@ -132,7 +133,7 @@ export function mapLeadsToCrmRecords(leads: Lead[], platform: CrmPlatform): Arra
           State: lead.state,
           PostalCode: lead.zip_code,
           LeadSource: lead.source_name || 'Ai Leads Hunter',
-          Rating: lead.lead_tier === 'Warm' ? 'Hot' : 'Warm',
+          Rating: lead.lead_tier === 'Hot' ? 'Hot' : lead.lead_tier === 'Warm' ? 'Warm' : 'Cold',
           Status: 'Open - Not Contacted',
           Description: note,
         };
@@ -166,8 +167,8 @@ export function mapLeadsToCrmRecords(leads: Lead[], platform: CrmPlatform): Arra
           State: lead.state,
           Zip_Code: lead.zip_code,
           Lead_Source: lead.source_name || 'Ai Leads Hunter',
-          Lead_Status: lead.lead_tier === 'Warm' ? 'Hot Lead' : 'Pre-Qualified',
-          Rating: lead.lead_tier === 'Warm' ? 'Active' : 'Acquired',
+          Lead_Status: lead.lead_tier === 'Hot' ? 'Hot Lead' : lead.lead_tier === 'Warm' ? 'Pre-Qualified' : 'Not Contacted',
+          Rating: lead.lead_tier === 'Hot' || lead.lead_tier === 'Warm' ? 'Active' : 'Acquired',
           Description: note,
         };
 
