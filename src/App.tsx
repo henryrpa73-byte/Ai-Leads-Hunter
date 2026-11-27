@@ -440,20 +440,24 @@ export default function App() {
           }
           if (r.website) totalWebsites += 1;
           if (r.project_name) totalProjects += 1;
-          if (r.phone) {
-            totalPhones += 1;
-            chunkPhones += 1;
-            const norm = normalizePhone(r.phone);
-            if (norm.digits) {
-              const orig = chunk.find((c) => c.id === r.id);
-              if (orig) {
-                enrichedForHistory.push({ ...orig, phone_digits: norm.digits });
-              }
+          if (r.phone || r.email) {
+            const orig = chunk.find((c) => c.id === r.id);
+            const norm = r.phone ? normalizePhone(r.phone) : { digits: '' };
+            if (r.phone) {
+              totalPhones += 1;
+              chunkPhones += 1;
             }
-          }
-          if (r.email) {
-            totalEmails += 1;
-            chunkEmails += 1;
+            if (r.email) {
+              totalEmails += 1;
+              chunkEmails += 1;
+            }
+            if (orig && (norm.digits || r.email)) {
+              enrichedForHistory.push({
+                ...orig,
+                phone_digits: norm.digits || orig.phone_digits,
+                business_email: r.email || orig.business_email,
+              });
+            }
           }
         }
         if (enrichedForHistory.length > 0) {
@@ -527,9 +531,13 @@ export default function App() {
         return;
       }
 
+      const { merged, addedCount, duplicateCount, crossSessionBlockedCount } = mergeLeadsDeduplicated(
+        leads,
+        freshLeads,
+        { checkCrossSession: freshOnly },
+      );
       recordDiscoveryUsage(freshLeads);
       setSeenHistory((prev) => recordSeenLeads(prev, freshLeads));
-      const { merged, addedCount, duplicateCount } = mergeLeadsDeduplicated(leads, freshLeads);
       setLeads(merged);
       if (!selectedLeadId && merged.length > 0) {
         setSelectedLeadId(merged[0].id);
@@ -537,8 +545,9 @@ export default function App() {
 
       const smsInBatch = getSmsReadyLeads(freshLeads).length;
       const warnText = data.summary.warnings.length ? ` (${data.summary.warnings.join('; ')})` : '';
-      const skippedText = totalSkipped > 0 ? `, ${totalSkipped} repeat phones/leads skipped` : '';
-      const step1Summary = `Found ${freshLeads.length} fresh leads (${addedCount} new${duplicateCount ? `, ${duplicateCount} merged` : ''}${skippedText}, ${smsInBatch} SMS-ready phones).`;
+      const allSkipped = totalSkipped + crossSessionBlockedCount;
+      const skippedText = allSkipped > 0 ? `, ${allSkipped} repeat phones/emails skipped` : '';
+      const step1Summary = `Found ${addedCount} fresh leads (${duplicateCount} merged${skippedText}, ${smsInBatch} SMS-ready phones).`;
 
       if (autoFindContacts && freshLeads.length > 0) {
         setHunting(false);
@@ -603,7 +612,12 @@ export default function App() {
         });
       } else {
         const rescoredParsed = rescoreAllLeads(parsed, scoringConfig);
-        const { merged, addedCount, duplicateCount } = mergeLeadsDeduplicated(leads, rescoredParsed);
+        const { merged, addedCount, duplicateCount, crossSessionBlockedCount } = mergeLeadsDeduplicated(
+          leads,
+          rescoredParsed,
+          { checkCrossSession: freshOnly },
+        );
+        setSeenHistory((prev) => recordSeenLeads(prev, rescoredParsed));
         setLeads(merged);
         if (!selectedLeadId && merged.length > 0) {
           setSelectedLeadId(merged[0].id);
@@ -616,7 +630,9 @@ export default function App() {
             (!l.business_email || !l.business_phone || !l.website || !l.project_name || !l.city),
         );
 
-        const importSummary = `Imported ${file.name}: ${addedCount} new leads added (${duplicateCount} duplicates merged).`;
+        const blockedNote =
+          crossSessionBlockedCount > 0 ? `, ${crossSessionBlockedCount} previously delivered skipped` : '';
+        const importSummary = `Imported ${file.name}: ${addedCount} new leads added (${duplicateCount} duplicates handled${blockedNote}).`;
         if (autoFindContacts && toEnrich.length > 0) {
           const cap = Math.min(100, toEnrich.length);
           const res = await enrichLeadsContacts(
@@ -710,13 +726,12 @@ export default function App() {
   };
 
   const handleResetSeenHistory = () => {
-    const empty = clearSeenHistory();
-    setSeenHistory(recordSeenLeads(empty, leads));
+    setSeenHistory(clearSeenHistory(leads));
     setConfirmResetSeen(false);
     setHuntPage(1);
     setBannerMessage({
       type: 'info',
-      text: 'Cleared past delivery history (phones currently in your active table remain protected).',
+      text: 'Cleared past delivery history (phones and emails currently in your active table remain protected).',
     });
   };
 

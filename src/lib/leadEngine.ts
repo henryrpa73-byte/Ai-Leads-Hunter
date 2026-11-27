@@ -507,44 +507,262 @@ export function buildNormalizedLead(
   };
 }
 
-export function mergeLeadsDeduplicated(existing: Lead[], incoming: Lead[]): {
+export const SEEN_CONTACTS_HASH_STORAGE_KEY = 'ai_leads_hunter_seen_contacts_hashmap_v1';
+const LEGACY_SEEN_HISTORY_STORAGE_KEY = 'ai_leads_hunter_seen_history_v1';
+const MAX_HASH_MAP_ENTRIES = 50000;
+
+export interface SeenContactHashMap {
+  phones: Record<string, true>;
+  emails: Record<string, true>;
+}
+
+export interface MergeLeadsOptions {
+  checkCrossSession?: boolean;
+  persistSeenContacts?: boolean;
+  seenContactsMap?: SeenContactHashMap;
+}
+
+export function normalizeEmailKey(raw: unknown): string {
+  const email = cleanText(raw).toLowerCase();
+  if (!email || !email.includes('@') || !email.includes('.')) return '';
+  return email;
+}
+
+function getNormalizedLeadPhoneDigits(lead: Partial<Lead>): string {
+  if (lead.phone_digits && /^\d{10}$/.test(lead.phone_digits)) {
+    return lead.phone_digits;
+  }
+  return normalizePhone(lead.business_phone).digits;
+}
+
+function trimHashRecord(record: Record<string, true>, limit = MAX_HASH_MAP_ENTRIES): Record<string, true> {
+  const keys = Object.keys(record);
+  if (keys.length <= limit) return record;
+  const trimmed: Record<string, true> = {};
+  for (const k of keys.slice(-limit)) {
+    trimmed[k] = true;
+  }
+  return trimmed;
+}
+
+export function loadSeenContactHashMap(): SeenContactHashMap {
+  const map: SeenContactHashMap = { phones: {}, emails: {} };
+  if (typeof localStorage === 'undefined') return map;
+
+  try {
+    const raw = localStorage.getItem(SEEN_CONTACTS_HASH_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<SeenContactHashMap>;
+      if (parsed.phones && typeof parsed.phones === 'object') {
+        for (const key of Object.keys(parsed.phones)) {
+          if (/^\d{10}$/.test(key) && parsed.phones[key]) {
+            map.phones[key] = true;
+          }
+        }
+      }
+      if (parsed.emails && typeof parsed.emails === 'object') {
+        for (const key of Object.keys(parsed.emails)) {
+          const norm = normalizeEmailKey(key);
+          if (norm && parsed.emails[key]) {
+            map.emails[norm] = true;
+          }
+        }
+      }
+    } else {
+      // One-time bootstrap from legacy seen-history array if present
+      const legacyRaw = localStorage.getItem(LEGACY_SEEN_HISTORY_STORAGE_KEY);
+      if (legacyRaw) {
+        const legacy = JSON.parse(legacyRaw) as { phones?: unknown; emails?: unknown };
+        if (Array.isArray(legacy.phones)) {
+          for (const p of legacy.phones) {
+            if (typeof p === 'string' && /^\d{10}$/.test(p)) map.phones[p] = true;
+          }
+        }
+        if (Array.isArray(legacy.emails)) {
+          for (const e of legacy.emails) {
+            const norm = normalizeEmailKey(e);
+            if (norm) map.emails[norm] = true;
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+
+  return map;
+}
+
+export function saveSeenContactHashMap(map: SeenContactHashMap): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const payload: SeenContactHashMap = {
+      phones: trimHashRecord(map.phones),
+      emails: trimHashRecord(map.emails),
+    };
+    localStorage.setItem(SEEN_CONTACTS_HASH_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage quota warnings
+  }
+}
+
+export function recordContactsInHashMap(
+  leads: Array<Partial<Lead>>,
+  targetMap?: SeenContactHashMap,
+): SeenContactHashMap {
+  const map = targetMap || loadSeenContactHashMap();
+  let changed = false;
+
+  for (const lead of leads) {
+    const phone = getNormalizedLeadPhoneDigits(lead);
+    if (phone && !map.phones[phone]) {
+      map.phones[phone] = true;
+      changed = true;
+    }
+    const email = normalizeEmailKey(lead.business_email);
+    if (email && !map.emails[email]) {
+      map.emails[email] = true;
+      changed = true;
+    }
+  }
+
+  if (changed && !targetMap) {
+    saveSeenContactHashMap(map);
+  }
+  return map;
+}
+
+export function clearSeenContactHashMap(preserveLeads: Array<Partial<Lead>> = []): SeenContactHashMap {
+  const fresh: SeenContactHashMap = { phones: {}, emails: {} };
+  for (const lead of preserveLeads) {
+    const phone = getNormalizedLeadPhoneDigits(lead);
+    if (phone) fresh.phones[phone] = true;
+    const email = normalizeEmailKey(lead.business_email);
+    if (email) fresh.emails[email] = true;
+  }
+  saveSeenContactHashMap(fresh);
+  return fresh;
+}
+
+export function mergeLeadsDeduplicated(
+  existing: Lead[],
+  incoming: Lead[],
+  options: MergeLeadsOptions = {},
+): {
   merged: Lead[];
   addedCount: number;
   duplicateCount: number;
+  crossSessionBlockedCount: number;
 } {
+  const checkCrossSession = options.checkCrossSession !== false;
+  const persistSeenContacts = options.persistSeenContacts !== false;
+  const externalMapSupplied = Boolean(options.seenContactsMap);
+  const seenMap: SeenContactHashMap = options.seenContactsMap || loadSeenContactHashMap();
+  let hashMapChanged = false;
+
   const result = existing.map((l) => ({ ...l, all_sources: [...l.all_sources] }));
+  const phoneIndex = new Map<string, number>();
+  const emailIndex = new Map<string, number>();
+  const domainIndex = new Map<string, number>();
+  const nameStateIndex = new Map<string, number>();
+
+  const indexLeadAt = (lead: Lead, idx: number) => {
+    const phone = getNormalizedLeadPhoneDigits(lead);
+    if (phone && !phoneIndex.has(phone)) phoneIndex.set(phone, idx);
+    const email = normalizeEmailKey(lead.business_email);
+    if (email && !emailIndex.has(email)) emailIndex.set(email, idx);
+    if (lead.domain && !domainIndex.has(lead.domain)) domainIndex.set(lead.domain, idx);
+    if (lead.normalized_name) {
+      const nameKey = lead.state ? `${lead.normalized_name}|${lead.state}` : lead.normalized_name;
+      if (!nameStateIndex.has(nameKey)) nameStateIndex.set(nameKey, idx);
+      if (!nameStateIndex.has(lead.normalized_name)) nameStateIndex.set(lead.normalized_name, idx);
+    }
+    if (phone && !seenMap.phones[phone]) {
+      seenMap.phones[phone] = true;
+      hashMapChanged = true;
+    }
+    if (email && !seenMap.emails[email]) {
+      seenMap.emails[email] = true;
+      hashMapChanged = true;
+    }
+  };
+
+  result.forEach((cur, idx) => indexLeadAt(cur, idx));
+
   let addedCount = 0;
   let duplicateCount = 0;
+  let crossSessionBlockedCount = 0;
 
   for (const item of incoming) {
     if (!item.company_name || item.normalized_name.length < 2) continue;
 
-    const matchIndex = result.findIndex((cur) => {
-      if (item.domain && cur.domain && item.domain === cur.domain) return true;
-      if (item.phone_digits && cur.phone_digits && item.phone_digits === cur.phone_digits) return true;
-      if (item.normalized_name && cur.normalized_name && item.normalized_name === cur.normalized_name) {
-        if (item.state && cur.state) return item.state === cur.state;
-        return true;
+    const itemPhone = getNormalizedLeadPhoneDigits(item);
+    const itemEmail = normalizeEmailKey(item.business_email);
+    const itemDomain = item.domain || normalizeWebsite(item.website).domain;
+    const itemNameStateKey = item.state
+      ? `${item.normalized_name}|${item.state}`
+      : item.normalized_name;
+
+    let matchIndex = -1;
+    if (itemPhone && phoneIndex.has(itemPhone)) {
+      matchIndex = phoneIndex.get(itemPhone)!;
+    } else if (itemEmail && emailIndex.has(itemEmail)) {
+      matchIndex = emailIndex.get(itemEmail)!;
+    } else if (itemDomain && domainIndex.has(itemDomain)) {
+      matchIndex = domainIndex.get(itemDomain)!;
+    } else if (nameStateIndex.has(itemNameStateKey)) {
+      const candidateIdx = nameStateIndex.get(itemNameStateKey)!;
+      const candidate = result[candidateIdx];
+      if (!item.state || !candidate.state || item.state === candidate.state) {
+        matchIndex = candidateIdx;
       }
-      return false;
-    });
+    } else if (!item.state && nameStateIndex.has(item.normalized_name)) {
+      matchIndex = nameStateIndex.get(item.normalized_name)!;
+    }
 
     if (matchIndex === -1) {
+      // Strict cross-session check against persisted hash map of all seen phones & emails
+      if (
+        checkCrossSession &&
+        ((itemPhone && seenMap.phones[itemPhone] === true) ||
+          (itemEmail && seenMap.emails[itemEmail] === true))
+      ) {
+        duplicateCount++;
+        crossSessionBlockedCount++;
+        continue;
+      }
+
+      const newIdx = result.length;
       result.push(item);
+      indexLeadAt(item, newIdx);
       addedCount++;
       continue;
     }
 
-    duplicateCount++;
     const cur = result[matchIndex];
+    const curPhone = getNormalizedLeadPhoneDigits(cur);
+    const curEmail = normalizeEmailKey(cur.business_email);
+
+    // Prevent merging if the incoming record introduces a phone/email already delivered on another cleared lead
+    if (
+      checkCrossSession &&
+      ((itemPhone && itemPhone !== curPhone && seenMap.phones[itemPhone] === true) ||
+        (itemEmail && itemEmail !== curEmail && seenMap.emails[itemEmail] === true))
+    ) {
+      duplicateCount++;
+      crossSessionBlockedCount++;
+      continue;
+    }
+
+    duplicateCount++;
     const combinedSources = Array.from(new Set([...cur.all_sources, ...item.all_sources]));
     const updated: Lead = {
       ...cur,
       website: cur.website || item.website,
-      domain: cur.domain || item.domain,
-      business_email: cur.business_email || item.business_email,
+      domain: cur.domain || itemDomain,
+      business_email: cur.business_email || itemEmail || item.business_email,
       business_phone: cur.business_phone || item.business_phone,
-      phone_digits: cur.phone_digits || item.phone_digits,
+      phone_digits: cur.phone_digits || itemPhone,
       phone_type: cur.phone_type || item.phone_type,
       contact_person: cur.contact_person || item.contact_person,
       job_title: cur.job_title || item.job_title,
@@ -577,10 +795,15 @@ export function mergeLeadsDeduplicated(existing: Lead[], incoming: Lead[]): {
       updated.qualification_reason = reScored.reason;
     }
     result[matchIndex] = updated;
+    indexLeadAt(updated, matchIndex);
+  }
+
+  if (persistSeenContacts && hashMapChanged && !externalMapSupplied) {
+    saveSeenContactHashMap(seenMap);
   }
 
   result.sort((a, b) => b.lead_score - a.lead_score);
-  return { merged: result, addedCount, duplicateCount };
+  return { merged: result, addedCount, duplicateCount, crossSessionBlockedCount };
 }
 
 function parseCsvLine(line: string): string[] {
