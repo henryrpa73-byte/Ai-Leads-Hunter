@@ -37,12 +37,21 @@ import {
   leadsToExcelBuffer,
   leadsToZoomSmsCsv,
   mergeLeadsDeduplicated,
+  normalizePhone,
   parseCsvToLeads,
   parseExcelToLeads,
   rescoreAllLeads,
   safeExternalUrl,
   type ScoringCriteriaConfig,
 } from './lib/leadEngine.ts';
+import {
+  clearSeenHistory,
+  filterFreshLeads,
+  loadSeenHistory,
+  recordSeenLeads,
+  saveSeenHistory,
+  type SeenHistoryState,
+} from './lib/seenHistory.ts';
 import type { DiscoveryResponse, Lead } from './types/lead.ts';
 
 type NavTab = 'pipeline' | 'warm' | 'report';
@@ -137,11 +146,16 @@ export default function App() {
   const [huntPage, setHuntPage] = useState<number>(1);
   const [smsPhonePriority, setSmsPhonePriority] = useState<boolean>(false);
   const [autoFindContacts, setAutoFindContacts] = useState<boolean>(true);
+  const [freshOnly, setFreshOnly] = useState<boolean>(true);
   const [hunting, setHunting] = useState(false);
   const [enrichingContacts, setEnrichingContacts] = useState(false);
   const [bannerMessage, setBannerMessage] = useState<{ type: 'info' | 'error'; text: string } | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [confirmResetSeen, setConfirmResetSeen] = useState(false);
   const [dailyQuota, setDailyQuota] = useState<DailyQuotaState>(() => loadDailyQuota());
+  const [seenHistory, setSeenHistory] = useState<SeenHistoryState>(() =>
+    recordSeenLeads(loadSeenHistory(), leads),
+  );
   const [smsTemplate, setSmsTemplate] = useState<string>(() => {
     try {
       return localStorage.getItem(SMS_TEMPLATE_KEY) || DEFAULT_ZOOM_SMS_TEMPLATE;
@@ -172,6 +186,10 @@ export default function App() {
   useEffect(() => {
     saveDailyQuota(dailyQuota);
   }, [dailyQuota]);
+
+  useEffect(() => {
+    saveSeenHistory(seenHistory);
+  }, [seenHistory]);
 
   useEffect(() => {
     try {
@@ -415,6 +433,7 @@ export default function App() {
 
         let chunkPhones = 0;
         let chunkEmails = 0;
+        const enrichedForHistory: Lead[] = [];
         for (const r of payload.results || []) {
           if (r.website || r.email || r.phone || r.contact_person || r.project_name || r.city) {
             totalEnriched += 1;
@@ -424,11 +443,21 @@ export default function App() {
           if (r.phone) {
             totalPhones += 1;
             chunkPhones += 1;
+            const norm = normalizePhone(r.phone);
+            if (norm.digits) {
+              const orig = chunk.find((c) => c.id === r.id);
+              if (orig) {
+                enrichedForHistory.push({ ...orig, phone_digits: norm.digits });
+              }
+            }
           }
           if (r.email) {
             totalEmails += 1;
             chunkEmails += 1;
           }
+        }
+        if (enrichedForHistory.length > 0) {
+          setSeenHistory((prev) => recordSeenLeads(prev, enrichedForHistory));
         }
         recordContactUsage(chunk.length, chunkPhones, chunkEmails);
       }
@@ -461,6 +490,9 @@ export default function App() {
           limit: huntLimit,
           page: huntPage,
           smsPhonePriority,
+          freshOnly,
+          excludePhones: freshOnly ? seenHistory.phones : [],
+          excludeKeys: freshOnly ? [...seenHistory.keys, ...seenHistory.domains] : [],
         }),
       });
       const data = (await resp.json()) as DiscoveryResponse & { error?: string };
@@ -469,12 +501,25 @@ export default function App() {
         return;
       }
 
-      const discovered = rescoreAllLeads(data.leads || [], scoringConfig);
-      if (discovered.length === 0) {
+      const rawDiscovered = rescoreAllLeads(data.leads || [], scoringConfig);
+      const { fresh: freshLeads, skippedDuplicates: clientSkipped } = freshOnly
+        ? filterFreshLeads(rawDiscovered, seenHistory, leads)
+        : { fresh: rawDiscovered, skippedDuplicates: 0 };
+      const totalSkipped = (data.summary.skippedDuplicates || 0) + clientSkipped;
+
+      if (typeof data.summary.nextPage === 'number' && data.summary.nextPage > 0) {
+        setHuntPage(data.summary.nextPage);
+      } else {
+        setHuntPage((p) => p + 1);
+      }
+
+      if (freshLeads.length === 0) {
         const warnDetails = data.summary.warnings.length
           ? data.summary.warnings.join(' ')
-          : 'No matching projects were returned for those filters. Try clearing the US State filter or switching Public Data Source to "All US Sources".';
-        setHuntPage(1);
+          : totalSkipped > 0
+            ? `All ${totalSkipped} returned records matched phones or companies already delivered to you. Switch US State or source to pull new territories.`
+            : 'No matching projects were returned for those filters. Try switching US State or Public Data Source.';
+        if (totalSkipped === 0) setHuntPage(1);
         setBannerMessage({
           type: 'error',
           text: warnDetails,
@@ -482,24 +527,25 @@ export default function App() {
         return;
       }
 
-      recordDiscoveryUsage(discovered);
-      const { merged, addedCount, duplicateCount } = mergeLeadsDeduplicated(leads, discovered);
+      recordDiscoveryUsage(freshLeads);
+      setSeenHistory((prev) => recordSeenLeads(prev, freshLeads));
+      const { merged, addedCount, duplicateCount } = mergeLeadsDeduplicated(leads, freshLeads);
       setLeads(merged);
-      setHuntPage((p) => p + 1);
       if (!selectedLeadId && merged.length > 0) {
         setSelectedLeadId(merged[0].id);
       }
 
-      const smsInBatch = getSmsReadyLeads(discovered).length;
+      const smsInBatch = getSmsReadyLeads(freshLeads).length;
       const warnText = data.summary.warnings.length ? ` (${data.summary.warnings.join('; ')})` : '';
-      const step1Summary = `Found ${data.summary.fetched} projects (${addedCount} new, ${duplicateCount} merged, ${smsInBatch} SMS-ready phones).`;
+      const skippedText = totalSkipped > 0 ? `, ${totalSkipped} repeat phones/leads skipped` : '';
+      const step1Summary = `Found ${freshLeads.length} fresh leads (${addedCount} new${duplicateCount ? `, ${duplicateCount} merged` : ''}${skippedText}, ${smsInBatch} SMS-ready phones).`;
 
-      if (autoFindContacts && discovered.length > 0) {
+      if (autoFindContacts && freshLeads.length > 0) {
         setHunting(false);
         const enrichBatch =
-          discovered.length > 40
-            ? discovered.filter((l) => !l.phone_digits).slice(0, 24)
-            : discovered;
+          freshLeads.length > 40
+            ? freshLeads.filter((l) => !l.phone_digits).slice(0, 24)
+            : freshLeads;
         const contactRes = await enrichLeadsContacts(enrichBatch, `Step 2/2: ${step1Summary} `);
         setBannerMessage({
           type: 'info',
@@ -651,11 +697,27 @@ export default function App() {
   };
 
   const handleClearAll = () => {
+    const blockedSnapshot = recordSeenLeads(seenHistory, leads);
+    setSeenHistory(blockedSnapshot);
     setLeads([]);
     setSelectedLeadId(null);
     setSelectedLeadIds(new Set());
     setConfirmClear(false);
-    setBannerMessage({ type: 'info', text: 'Local lead pipeline cleared.' });
+    setBannerMessage({
+      type: 'info',
+      text: `Pipeline table cleared. ${blockedSnapshot.phones.length.toLocaleString()} delivered phone number(s) stay blocked so future runs only give you fresh leads.`,
+    });
+  };
+
+  const handleResetSeenHistory = () => {
+    const empty = clearSeenHistory();
+    setSeenHistory(recordSeenLeads(empty, leads));
+    setConfirmResetSeen(false);
+    setHuntPage(1);
+    setBannerMessage({
+      type: 'info',
+      text: 'Cleared past delivery history (phones currently in your active table remain protected).',
+    });
   };
 
   const toggleSelectLead = (id: string) => {
@@ -992,6 +1054,50 @@ export default function App() {
                 />
                 Auto-find phones &amp; emails
               </label>
+
+              <label
+                title="Permanently remembers every phone number and company delivered to you so you never receive repeats on future days, even after clearing the table."
+                className="h-9 px-2.5 inline-flex items-center gap-2 text-xs text-slate-700 bg-emerald-50/70 border border-emerald-200 rounded-md cursor-pointer select-none whitespace-nowrap"
+              >
+                <input
+                  type="checkbox"
+                  checked={freshOnly}
+                  onChange={(e) => setFreshOnly(e.target.checked)}
+                  className="rounded border-slate-300 text-emerald-700 focus:ring-emerald-700"
+                />
+                <span>Never Repeat Phones</span>
+                <span className="font-mono-tabular text-[11px] text-emerald-800">
+                  ({seenHistory.phones.length.toLocaleString()} blocked)
+                </span>
+              </label>
+
+              {(seenHistory.phones.length > 0 || seenHistory.keys.length > 0) &&
+                (confirmResetSeen ? (
+                  <div className="inline-flex items-center gap-1.5 text-[11px]">
+                    <button
+                      type="button"
+                      onClick={handleResetSeenHistory}
+                      className="px-2 py-1 font-medium text-white bg-red-600 rounded hover:bg-red-700 whitespace-nowrap"
+                    >
+                      Confirm Reset History
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmResetSeen(false)}
+                      className="px-1.5 py-1 text-slate-500 hover:text-slate-900 whitespace-nowrap"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmResetSeen(true)}
+                    className="h-9 px-2 text-[11px] text-slate-500 hover:text-slate-900 underline underline-offset-2 whitespace-nowrap"
+                  >
+                    Reset Seen History
+                  </button>
+                ))}
             </div>
 
             <div className="flex flex-wrap items-center gap-2.5">

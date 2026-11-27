@@ -59,5 +59,7 @@ export interface DiscoveryResponse {
     fetched: number;
     sourcesRun: string[];
     warnings: string[];
+    nextPage?: number;
+    skippedDuplicates?: number;
   };
 }

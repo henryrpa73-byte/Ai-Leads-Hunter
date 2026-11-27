@@ -127,7 +127,7 @@ async function discoverUsaSpending(stateFilter: string, limitPerNaics: number, p
         },
         limit: perNaics,
         page: Math.max(1, page),
-        sort: 'Award Amount',
+        sort: 'Start Date',
         order: 'desc',
       };
 
@@ -1309,7 +1309,7 @@ async function lookupCompanyUsaSpendingProject(
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '5mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
@@ -1327,6 +1327,22 @@ async function startServer() {
         ? Math.max(1, Math.min(50, Number(req.body.page)))
         : 1;
       const smsPhonePriority = Boolean(req.body?.smsPhonePriority);
+      const freshOnly = req.body?.freshOnly !== false;
+
+      const rawExcludePhones = Array.isArray(req.body?.excludePhones) ? req.body.excludePhones : [];
+      const rawExcludeKeys = Array.isArray(req.body?.excludeKeys) ? req.body.excludeKeys : [];
+      const seenPhones = new Set<string>(
+        rawExcludePhones
+          .slice(-40000)
+          .map((p: unknown) => String(p || '').replace(/\D/g, '').slice(-10))
+          .filter((p: string) => p.length === 10),
+      );
+      const seenKeys = new Set<string>(
+        rawExcludeKeys
+          .slice(-40000)
+          .map((k: unknown) => String(k || '').trim().toLowerCase())
+          .filter(Boolean),
+      );
 
       const hasDirectPhonePermitPortal = !state || state === 'TX' || state === 'NY' || state === 'FL';
       const hasAnyPermitPortal = !state || ['TX', 'NY', 'IL', 'FL', 'WA', 'OH', 'LA'].includes(state);
@@ -1399,21 +1415,79 @@ async function startServer() {
         return { allLeads, sourcesRun, warnings };
       };
 
-      let result = await runDiscoveryPass(requestedPage);
-      if (result.allLeads.length === 0 && requestedPage > 1) {
-        const retry = await runDiscoveryPass(1);
-        if (retry.allLeads.length > 0) {
-          result = retry;
-          result.warnings.push(`Page ${requestedPage} had no more records; reset to page 1.`);
+      let currentPage = requestedPage;
+      const accumulated: Lead[] = [];
+      const sourcesSet = new Set<string>();
+      const warningSet = new Set<string>();
+      let skippedDuplicates = 0;
+
+      const filterUniqueFresh = (batch: Lead[]): Lead[] => {
+        const out: Lead[] = [];
+        for (const lead of batch) {
+          if (!lead.company_name || lead.normalized_name.length < 2) {
+            skippedDuplicates++;
+            continue;
+          }
+          if (lead.phone_digits && lead.phone_digits.length === 10) {
+            if (seenPhones.has(lead.phone_digits)) {
+              skippedDuplicates++;
+              continue;
+            }
+          }
+          const compKey = lead.state
+            ? `${lead.normalized_name}|${lead.state.toLowerCase()}`
+            : lead.normalized_name;
+          if (freshOnly && compKey && seenKeys.has(compKey)) {
+            skippedDuplicates++;
+            continue;
+          }
+          if (lead.phone_digits && lead.phone_digits.length === 10) {
+            seenPhones.add(lead.phone_digits);
+          }
+          if (compKey) {
+            seenKeys.add(compKey);
+          }
+          out.push(lead);
+        }
+        return out;
+      };
+
+      const maxHops = freshOnly ? 4 : 1;
+      const targetMinCount = Math.max(5, Math.min(60, limit * 2));
+
+      for (let hop = 0; hop < maxHops; hop++) {
+        const pass = await runDiscoveryPass(currentPage);
+        pass.sourcesRun.forEach((s) => sourcesSet.add(s));
+        pass.warnings.forEach((w) => warningSet.add(w));
+
+        if (pass.allLeads.length === 0) {
+          if (hop === 0 && currentPage > 1) {
+            currentPage = 1;
+            const retry = await runDiscoveryPass(currentPage);
+            retry.sourcesRun.forEach((s) => sourcesSet.add(s));
+            retry.warnings.forEach((w) => warningSet.add(w));
+            accumulated.push(...filterUniqueFresh(retry.allLeads));
+          }
+          break;
+        }
+
+        const freshBatch = filterUniqueFresh(pass.allLeads);
+        accumulated.push(...freshBatch);
+        currentPage += 1;
+
+        if (!freshOnly || accumulated.length >= targetMinCount || currentPage > 50) {
+          break;
         }
       }
 
       res.json({
-        leads: result.allLeads,
+        leads: accumulated,
         summary: {
-          fetched: result.allLeads.length,
-          sourcesRun: result.sourcesRun,
-          warnings: result.warnings,
+          fetched: accumulated.length,
+          sourcesRun: Array.from(sourcesSet),
+          warnings: Array.from(warningSet),
+          nextPage: currentPage > 50 ? 1 : currentPage,
+          skippedDuplicates,
         },
       });
     } catch (err) {
